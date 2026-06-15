@@ -2,6 +2,8 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 
+Path("prodjobs/lists").mkdir(parents=True, exist_ok=True)
+
 for filename in tqdm(Path("prodjobs/raw").glob("*.json")):
     with open(filename) as file:
         data = json.loads(file.read())
