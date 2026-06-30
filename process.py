@@ -1,32 +1,87 @@
-import json
-from tqdm import tqdm
+from dotenv import dotenv_values
 from fetchcarbon import get_rounded_iso_range, get_climate_data
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import matplotlib.pyplot as plt
-import random
+import mariadb
 
-def get_jobs(filename, do_random=True, show_progress=True):
-    line_offsets = []
+STATES = [
+    "PENDING", # 0
+    "RUNNING", # 1
+    "SUSPENDED", # 2
+    "COMPLETED", # 3
+    "CANCELLED", # 4
+    "FAILED", # 5
+    "TIMEOUT", # 6
+    None,
+    None,
+    None,
+    None,
+    "NODE_FAIL", # 11
+]
 
-    with open(filename, "rb") as file:
-        while True:
-            offset = file.tell()
-            if not file.readline():
-                break
-            line_offsets.append(offset)
+TRES_KEYS = {
+    1: "cpu",
+    2: "mem",
+    3: "energy",
+    4: "node",
+    5: "billing",
+    6: "disk",
+    7: "vmem",
+    8: "pages",
+    1001: "gpu",
+    1002: "gpumem",
+    1003: "gpuutil",
+    1004: "gpu:a100",
+    1005: "gpu:a100_1g.10gb",
+    1006: "gpu:1g.10gb"
+}
 
-    if do_random:
-        random.shuffle(line_offsets)
+def job_row_to_dict(row):
+    time_dict = {}
+    time_dict["start"] = row["time_start"]
+    time_dict["end"] = row["time_end"]
+    time_dict["elapsed"] = row["time_end"] - row["time_start"]
+    time_dict["total"] = row["total_cpu_time"]
+    row_dict = {"time": time_dict}
+    row_dict["state"] = STATES[row["state"]]
+    for line in row["tres_alloc"].split(","):
+        key, value = tuple(map(int, line.split("=")))
+        row_dict["tres_"+TRES_KEYS[key]] = value
+    row_dict["job_db_inx"] = row["job_db_inx"]
+    return row_dict
 
-    with open(filename, "r", encoding="utf-8") as file:
-        for offset in tqdm(line_offsets):
-            file.seek(offset)
-            yield json.loads(file.readline().strip())
+def get_jobs(start_window, end_window):
+    creds = dotenv_values(".env")
+    conn = mariadb.connect(user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["DB_DATABASE"])
+    with conn:
+        with conn.cursor(dictionary=True) as cursor:
+            query = f"""
+                SELECT
+                    job_table.job_db_inx AS job_db_inx,  
+                    job_table.id_job AS id_job,
+                    job_table.state AS state,
+                    job_table.time_start AS time_start,
+                    job_table.time_end AS time_end,
+                    job_table.tres_alloc AS tres_alloc,
+                    CAST(SUM(step_table.user_sec + step_table.sys_sec + (step_table.sys_usec / 1000000) + (step_table.user_usec / 1000000)) AS DECIMAL(18, 6)) AS total_cpu_time
+                FROM 
+                    {creds["JOB_TABLE"]} job_table
+                JOIN 
+                    {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
+                WHERE
+                    job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s AND job_table.state = 3
+                GROUP BY 
+                    job_table.job_db_inx;
+            """
+
+            cursor.execute(query, (start_window, end_window, start_window))
+
+            for row in cursor:
+                yield job_row_to_dict(row)
 
 def calc_energy_of_job(job, p_idle=220, p_max=850):
     elapsed_time = job["time"]["elapsed"] # wall clock time
-    cpu_time = job["time"]["total"] # total cpu time
-    cpu_time = cpu_time["seconds"] + (cpu_time["microseconds"] / 10**6)
+    cpu_time = float(job["time"]["total"]) # total cpu time
 
     # elapsed_time is rounded to the nearest second, and multi-core jobs are likely to use more
     # than elapsed_time so cpu_time can overshoot
@@ -38,9 +93,8 @@ def calc_energy_of_job(job, p_idle=220, p_max=850):
         cpu_time = 1
         elapsed_time = 1
 
-    tres_allocated = {item["type"]: item["count"] for item in job["tres"]["allocated"]}
-    nodes = tres_allocated["node"] # number of nodes requested
-    cpus_total = tres_allocated["cpu"] # total number of CPUs allocated (not per node)
+    nodes = job["tres_node"] # number of nodes requested
+    cpus_total = job["tres_cpu"] # total number of CPUs allocated (not per node)
 
     # average CPU utilization across the job
     u = cpu_time / (elapsed_time * cpus_total)
@@ -54,13 +108,15 @@ def calc_energy_of_job(job, p_idle=220, p_max=850):
 
     return energy_kwh
 
-jobs_filename = "prodjobs/lists/may4th2026.jsonl"
+def get_jobs_and_energy(chosen_day):
+    start_time = chosen_day.timestamp()
+    end_time = (chosen_day + timedelta(days=1)).timestamp()
 
-jobs = {}
-min_start, max_end = float("inf"), float("-inf")
-for job in get_jobs(jobs_filename):
-    state, start, end = job["state"]["current"][0], job["time"]["start"], job["time"]["end"]
-    if state == "COMPLETED":
+    jobs = {}
+    min_start, max_end = float("inf"), float("-inf")
+    for job in get_jobs(start_time, end_time):
+        state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
+        assert state == "COMPLETED", state # Not sure if needed
         assert start != 0 and end != 0, f"{job['job_id']} {state} {start} {end}"
         if start < min_start:
             min_start = start
@@ -71,75 +127,89 @@ for job in get_jobs(jobs_filename):
         if timerange not in jobs:
             jobs[timerange] = []
         jobs[timerange].append(energy)
+    return jobs, min_start, max_end
 
-limitstart, limitend = get_rounded_iso_range(min_start, max_end)
+def iter_periods(startv, endv, minutes=5):
+    step = timedelta(minutes=minutes)
+    while startv < endv:
+        yield startv, startv + step
+        startv += step
 
-carbon_intensity = get_climate_data("2026-06-02T00:30Z", "2026-06-04T10:30Z", "OX11", "forecast")
-
-energy_by_period = {}
-jobs_by_period = {}
-carbon_intensity_by_period = {}
-interval_mins = 5
-limitstart, limitend = datetime.fromisoformat(limitstart), datetime.fromisoformat(limitend)
-start = limitstart
-while True:
-    end = start + timedelta(minutes=interval_mins)
-    startts, endts = start.timestamp(), end.timestamp()
-
-    jobs_by_period[endts] = 0
-    subtotal = 0
+def accum_job_over_window(jobs, starttsv, endtsv):
+    jobs_total = 0
+    energy_total = 0
 
     for (job_start, job_end), energies in jobs.items():
         job_duration = job_end - job_start
 
-        overlap_start = max(startts, job_start)
-        overlap_end = min(endts, job_end)
+        overlap_start = max(starttsv, job_start)
+        overlap_end = min(endtsv, job_end)
 
         if overlap_end <= overlap_start:
             continue
 
-        jobs_by_period[endts] += 1
+        jobs_total += 1
 
         overlap = overlap_end - overlap_start
         fraction = overlap / job_duration
 
         for energy in energies:
-            subtotal += energy * fraction
+            energy_total += energy * fraction
     
-    energy_by_period[endts] = subtotal
+    return energy_total, jobs_total
 
-    chosen_carbon_intensity = None
-    for carbonstartts, carbonendts in carbon_intensity:
-        startinrange = startts >= carbonstartts and startts <= carbonendts
-        endinrange = endts >= carbonstartts and endts <= carbonendts
-        if startinrange == endinrange:
-            chosen_carbon_intensity = carbon_intensity[(carbonstartts, carbonendts)]
-    carbon_intensity_by_period[endts] = (subtotal * chosen_carbon_intensity) / 1000
+def get_graph_data(jobs, min_start, max_end):
+    limitstart, limitend = get_rounded_iso_range(min_start, max_end)
+    carbon_intensity = get_climate_data(limitstart, limitend, "OX11", "forecast")
 
-    if endts >= limitend.timestamp():
-        break
-    start += timedelta(minutes=interval_mins)
+    periods = []
+    limitstart, limitend = datetime.fromisoformat(limitstart), datetime.fromisoformat(limitend)
+    for start, end in iter_periods(limitstart, limitend):
+        startts, endts = start.timestamp(), end.timestamp()
 
-carbon_intensity_for_graph = {datetime.fromtimestamp(timerange[0]): value for timerange, value in carbon_intensity.items()}
-cifg_keys = sorted(carbon_intensity_for_graph)
+        energy_total, jobs_total = accum_job_over_window(jobs, startts, endts)
+        
+        chosen_carbon_intensity = None
+        for carbonstartts, carbonendts in carbon_intensity:
+            if not (endts <= carbonstartts or startts >= carbonendts):
+                chosen_carbon_intensity = carbon_intensity[(carbonstartts, carbonendts)]
+                break
 
-keys = sorted(energy_by_period)
-xkeys = [datetime.fromtimestamp(key) for key in keys]
+        period = {
+            "time": end,
+            "energy": energy_total,
+            "jobs": jobs_total,
+            "intensity": chosen_carbon_intensity,
+            "carbon": (energy_total * chosen_carbon_intensity) / 1000
+        }
 
-fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(10, 8))
-ax1, ax2, ax3, ax4 = axes.flatten()
+        periods.append(period)
 
-ax1.plot(xkeys, [energy_by_period[key] for key in keys])
-ax1.set_title("Energy (kWh)")
+    return periods
 
-ax2.plot(xkeys, [jobs_by_period[key] for key in keys])
-ax2.set_title("Number of jobs")
+def draw_graphs(periods):
+    times = [p["time"] for p in periods]
 
-ax3.plot(cifg_keys, [carbon_intensity_for_graph[key] for key in cifg_keys])
-ax3.set_title("Carbon intensity of grid (gCO₂/kWh)")
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    ax1, ax2, ax3, ax4 = axes.flatten()
 
-ax4.plot(xkeys, [carbon_intensity_by_period[key] for key in keys])
-ax4.set_title("Carbon intensity of jobs (kgCO₂)")
+    ax1.plot(times, [p["energy"] for p in periods])
+    ax1.set_title("Energy (kWh)")
 
-plt.tight_layout()
-plt.show()
+    ax2.plot(times, [p["jobs"] for p in periods])
+    ax2.set_title("Number of jobs")
+
+    ax3.plot(times, [p["intensity"] for p in periods])
+    ax3.set_title("Grid carbon intensity (gCO₂/kWh)")
+
+    ax4.plot(times, [p["carbon"] for p in periods])
+    ax4.set_title("Job carbon impact (kgCO₂)")
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    chosen_day = datetime(2026, 5, 4, tzinfo=timezone.utc)
+    jobs, min_start, max_end = get_jobs_and_energy(chosen_day)
+    periods = get_graph_data(jobs, min_start, max_end)
+    draw_graphs(periods)
