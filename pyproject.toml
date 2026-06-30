@@ -4,7 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "dataset>=2.0.0",
+    "mariadb>=1.1.14",
     "matplotlib>=3.10.9",
+    "python-dotenv>=1.2.2",
     "requests>=2.34.2",
     "tqdm>=4.68.1",
 ]
