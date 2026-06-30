@@ -1,11 +1,22 @@
 *.json
 *.jsonl
+*.txt
 
 *.db
 *.db-shm
 *.db-wal
 
+.env
+
+###
+
 *.pyc
 __pycache__
 
 uv.lock
+
+venv/
+.venv/
+env/
+
+.ipynb_checkpoints/
