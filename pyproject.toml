@@ -1,7 +1,7 @@
 [project]
 name = "carbonschedulinglotus"
 version = "0.1.0"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "dataset>=2.0.0",
     "mariadb>=1.1.14",

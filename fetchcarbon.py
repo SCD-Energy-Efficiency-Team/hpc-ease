@@ -1,9 +1,11 @@
 import dataset
 import requests
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 import math
 
 BASE = "https://api.carbonintensity.org.uk"
+db = dataset.connect("sqlite:///carbondata.db")
 
 def gen_iso_string(epoch_time):
     return datetime.fromtimestamp(epoch_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
@@ -32,6 +34,7 @@ def parse_time_inputs(start, end):
         raise Exception(thetype)
 
 def fetch_climate_data_pure(start, end, postcode="OX11"):
+    print(f"Downloading carbon intensity data between {start} and {end}...")
     start, end = parse_time_inputs(start, end)
 
     url = f"{BASE}/regional/intensity/{start}/{end}/postcode/{postcode}"
@@ -41,7 +44,6 @@ def fetch_climate_data_pure(start, end, postcode="OX11"):
     regionid, shortname = data["regionid"], data["shortname"]
     data = data["data"]
 
-    db = dataset.connect("sqlite:///carbondata.db")
     db["regions"].upsert(dict(regionid=regionid, shortname=shortname), ["regionid"])
     db["postcodes"].upsert(dict(postcode=postcode, regionid=regionid, shortname=shortname), ["postcode"])
 
@@ -58,7 +60,6 @@ def fetch_climate_data_pure(start, end, postcode="OX11"):
 def fetch_climate_data(start, end, postcode="OX11"):
     start, end = parse_time_inputs(start, end)
 
-    db = dataset.connect("sqlite:///carbondata.db")
     region_row = db["postcodes"].find_one(postcode=postcode)
     if region_row is None:
         url = f"{BASE}/regional/postcode/{postcode}"
@@ -92,12 +93,18 @@ def fetch_climate_data(start, end, postcode="OX11"):
     for arange in ranges:
         fetch_climate_data_pure(*arange, postcode)
 
+cache = {}
+
 def get_climate_data(start, end, postcode="OX11", returnvalues="forecast"):
     # returnvalues can be "forecast", "index" or "both"
+    # "forecast" is carbon intensity (in gco2/kwh) and index is "very low"/"low"/etc.
     assert returnvalues in ["forecast", "index", "both"]
     start, end = parse_time_inputs(start, end)
 
-    db = dataset.connect("sqlite:///carbondata.db")
+    cache_key = (start, end, postcode, returnvalues)
+    if cache_key in cache:
+        return cache[cache_key]
+
     fetch_climate_data(start, end, postcode)
     region_row = db["postcodes"].find_one(postcode=postcode)
     assert region_row is not None
@@ -111,7 +118,7 @@ def get_climate_data(start, end, postcode="OX11", returnvalues="forecast"):
         iso_start, iso_end = gen_iso_string(start.timestamp()), gen_iso_string(end.timestamp())
         intensity_row = db[tablebasename+"_intensity"].find_one(timerange=f"{iso_start},{iso_end}")
         forecast, index = intensity_row["forecast"], intensity_row["index"]
-        key = (start.timestamp(), end.timestamp())
+        key = (start, end)
         if returnvalues == "forecast":
             results[key] = forecast
         elif returnvalues == "index":
@@ -123,8 +130,63 @@ def get_climate_data(start, end, postcode="OX11", returnvalues="forecast"):
         if gen_iso_string(limitend.timestamp()) == iso_end:
             break
         start += timedelta(minutes=30)
+
+    cache[cache_key] = results
     return results
 
+def build_intensity_prefix(intensity_data):
+    prefix = []
+
+    for (start, end), intensity in sorted(intensity_data.items()):
+        prefix.append((start, end, intensity))
+
+    return prefix
+
+def calculate_cumulative_intensity(window_start, window_end, prefix):
+    total = 0.0
+    covered = timedelta(0)
+
+    for period_start, period_end, intensity in prefix:
+        if period_end <= window_start:
+            continue
+        if period_start >= window_end:
+            break
+
+        overlap_start = max(window_start, period_start)
+        overlap_end = min(window_end, period_end)
+
+        overlap = overlap_end - overlap_start
+        covered += overlap
+        total += intensity * overlap.total_seconds() / 3600
+
+    return total, covered
+
+def yield_lowest_periods(start_datetime, duration, postcode="OX11"):
+    start_datetime = min(start_datetime, datetime.now())
+    end_datetime = start_datetime + timedelta(hours=96)
+    limitstart, limitend = get_rounded_iso_range(start_datetime.timestamp(), end_datetime.timestamp())
+    carbon_intensity = get_climate_data(limitstart, limitend, postcode, "forecast")
+    carbon_prefix = build_intensity_prefix(carbon_intensity)
+    window_start = datetime.fromisoformat(limitstart)
+    window_end = window_start + timedelta(seconds=duration)
+
+    # TODO: This might break in the case duration is less than the interval between window start and end?
+    windows = defaultdict(list)
+    while window_end < datetime.fromisoformat(limitend):
+        intensity, covered = calculate_cumulative_intensity(window_start, window_end, carbon_prefix)
+        
+        if covered != timedelta(seconds=duration):
+            break
+
+        windows[intensity].append(window_start)
+
+        window_start += timedelta(minutes=1)
+        window_end = window_start + timedelta(seconds=duration)
+
+    for value in sorted(windows):
+        for window_start in windows[value]:
+            yield value, window_start, window_start + timedelta(seconds=duration)
+
 if __name__ == "__main__":
-    print(fetch_climate_data("2026-06-01T00:00Z", "2026-06-05T00:00Z", "OX11"))
-    #print(get_climate_data("2026-06-02T00:30Z", "2026-06-04T10:30Z", "OX11", "forecast"))
+    # print(fetch_climate_data("2026-06-01T00:00Z", "2026-06-05T00:00Z", "OX11"))
+    print(get_climate_data("2026-06-02T00:30Z", "2026-06-04T10:30Z", "OX11"))
