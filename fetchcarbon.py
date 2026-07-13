@@ -2,6 +2,7 @@ import dataset
 import requests
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from functools import lru_cache
 import math
 
 BASE = "https://api.carbonintensity.org.uk"
@@ -161,6 +162,7 @@ def calculate_cumulative_intensity(window_start, window_end, prefix):
 
     return total, covered
 
+@lru_cache(maxsize=100)
 def yield_lowest_periods(start_datetime, duration, postcode="OX11"):
     start_datetime = min(start_datetime, datetime.now())
     end_datetime = start_datetime + timedelta(hours=96)
@@ -183,9 +185,11 @@ def yield_lowest_periods(start_datetime, duration, postcode="OX11"):
         window_start += timedelta(minutes=1)
         window_end = window_start + timedelta(seconds=duration)
 
+    results = []
     for value in sorted(windows):
         for window_start in windows[value]:
-            yield value, window_start, window_start + timedelta(seconds=duration)
+            results.append((value, window_start, window_start + timedelta(seconds=duration)))
+    return results
 
 if __name__ == "__main__":
     # print(fetch_climate_data("2026-06-01T00:00Z", "2026-06-05T00:00Z", "OX11"))

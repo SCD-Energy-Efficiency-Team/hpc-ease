@@ -64,11 +64,15 @@ def job_row_to_dict(row):
     assert row == {}
     return row_dict
 
-def get_jobs(start_window, end_window):
+def get_jobs(start_window, end_window, by_submit_time=False):
     creds = dotenv_values(".env")
     conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["DB_DATABASE"])
     with conn:
-        with conn.cursor(dictionary=True) as cursor:
+        with conn.cursor(dictionary=True, buffered=False) as cursor:
+            if not by_submit_time:
+                where_clause = "job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s AND job_table.state = 3"
+            else:
+                where_clause = "job_table.time_submit >= %s AND job_table.time_submit <= %s AND job_table.state = 3"
             query = f"""
                 SELECT
                     job_table.job_db_inx AS job_db_inx,  
@@ -86,14 +90,15 @@ def get_jobs(start_window, end_window):
                 JOIN 
                     {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
                 WHERE
-                    job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s AND job_table.state = 3
+                    {where_clause}
                 GROUP BY 
                     job_table.job_db_inx
-                ORDER BY 
-                    job_table.time_submit ASC;
             """
 
-            cursor.execute(query, (start_window, end_window, start_window))
+            if not by_submit_time:
+                cursor.execute(query, (start_window, end_window, start_window))
+            else:
+                cursor.execute(query, (start_window, end_window))
 
             for row in cursor:
                 yield job_row_to_dict(row)
@@ -123,32 +128,29 @@ def calc_energy_of_job(job, p_idle=220, p_max=850):
     # joules = total_power * elapsed_time
     return energy_kwh
 
+def aggregate_jobs(jobs_iter):
+    jobs = defaultdict(list)
+    min_start, max_end = float("inf"), float("-inf")
+    for job in jobs_iter:
+        state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
+        assert start != 0 and end != 0, f"{job['job_id']} {state} {start} {end}"
+        min_start = min(min_start, start)
+        max_end = max(max_end, end)
+        jobs[(start, end)].append(calc_energy_of_job(job))
+    return dict(jobs), min_start, max_end
+
 def get_jobs_and_energy(chosen_day):
     start_time = chosen_day.timestamp()
     end_time = (chosen_day + DURATION_TO_FETCH).timestamp()
 
-    jobs = {}
-    min_start, max_end = float("inf"), float("-inf")
-    for job in get_jobs(start_time, end_time):
-        state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
-        assert start != 0 and end != 0, f"{job['job_id']} {state} {start} {end}"
-        if start < min_start:
-            min_start = start
-        if end > max_end:
-            max_end = end
-        energy = calc_energy_of_job(job)
-        timerange = (start, end)
-        if timerange not in jobs:
-            jobs[timerange] = []
-        jobs[timerange].append(energy)
-    return jobs, min_start, max_end
+    return aggregate_jobs(get_jobs(start_time, end_time, by_submit_time=False))
 
 def get_jobs_and_energy_reschedule(chosen_day):
     start_time = chosen_day.timestamp()
     end_time = (chosen_day + DURATION_TO_FETCH).timestamp()
 
     groups = defaultdict(list)
-    for job in get_jobs(start_time, end_time):
+    for job in get_jobs(start_time, end_time, by_submit_time=True):
         submit_time = datetime.fromtimestamp(job["time"]["submit"])
         submit_group = (submit_time.year, submit_time.month, submit_time.day, submit_time.hour, submit_time.minute)
         groups[submit_group].append(job)
@@ -156,21 +158,7 @@ def get_jobs_and_energy_reschedule(chosen_day):
     for key in tqdm(sorted(groups)):
         scheduler.process_jobs(groups[key])
 
-    jobs = {}
-    min_start, max_end = float("inf"), float("-inf")
-    for job in scheduler.output_jobs():
-        state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
-        assert start != 0 and end != 0, f"{job['job_id']} {state} {start} {end}"
-        if start < min_start:
-            min_start = start
-        if end > max_end:
-            max_end = end
-        energy = calc_energy_of_job(job)
-        timerange = (start, end)
-        if timerange not in jobs:
-            jobs[timerange] = []
-        jobs[timerange].append(energy)
-    return jobs, min_start, max_end
+    return aggregate_jobs(scheduler.output_jobs())
 
 def iter_periods(startv, endv, minutes=5):
     step = timedelta(minutes=minutes)
