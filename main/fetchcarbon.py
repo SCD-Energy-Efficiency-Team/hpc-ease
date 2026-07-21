@@ -4,9 +4,13 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from functools import lru_cache
 import math
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 BASE = "https://api.carbonintensity.org.uk"
-db = dataset.connect("sqlite:///carbondata.db")
+db = dataset.connect("sqlite:///../carbondata.db")
 
 def gen_iso_string(epoch_time):
     return datetime.fromtimestamp(epoch_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
@@ -35,7 +39,7 @@ def parse_time_inputs(start, end):
         raise Exception(thetype)
 
 def fetch_climate_data_pure(start, end, postcode="OX11"):
-    print(f"Downloading carbon intensity data between {start} and {end}...")
+    logger.info(f"Downloading carbon intensity data between {start} and {end}...")
     start, end = parse_time_inputs(start, end)
 
     url = f"{BASE}/regional/intensity/{start}/{end}/postcode/{postcode}"
@@ -94,6 +98,9 @@ def fetch_climate_data(start, end, postcode="OX11"):
     for arange in ranges:
         fetch_climate_data_pure(*arange, postcode)
 
+class MissingCarbonData(Exception):
+    pass
+
 cache = {}
 
 def get_climate_data(start, end, postcode="OX11", returnvalues="forecast"):
@@ -118,6 +125,8 @@ def get_climate_data(start, end, postcode="OX11", returnvalues="forecast"):
         end = start + timedelta(minutes=30)
         iso_start, iso_end = gen_iso_string(start.timestamp()), gen_iso_string(end.timestamp())
         intensity_row = db[tablebasename+"_intensity"].find_one(timerange=f"{iso_start},{iso_end}")
+        if intensity_row is None:
+            raise MissingCarbonData(f"Missing data for {start} to {end}")
         forecast, index = intensity_row["forecast"], intensity_row["index"]
         key = (start, end)
         if returnvalues == "forecast":
@@ -193,4 +202,6 @@ def yield_lowest_periods(start_datetime, duration, postcode="OX11"):
 
 if __name__ == "__main__":
     # print(fetch_climate_data("2026-06-01T00:00Z", "2026-06-05T00:00Z", "OX11"))
-    print(get_climate_data("2026-06-02T00:30Z", "2026-06-04T10:30Z", "OX11"))
+    # print(get_climate_data("2026-06-02T00:30Z", "2026-06-04T10:30Z", "OX11"))
+    start_range, end_range = 1725608400, 1780351201
+    get_climate_data(*get_rounded_iso_range(start_range, end_range), "OX11")

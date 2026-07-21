@@ -1,14 +1,31 @@
+import faulthandler
+import signal
 from dotenv import dotenv_values
-from fetchcarbon import get_rounded_iso_range, get_climate_data
 from datetime import datetime, timezone, timedelta
 import matplotlib.pyplot as plt
 import mariadb
 from collections import defaultdict
-from scheduling import CarbonScheduler
 from tqdm import tqdm
 import random
+import typer
+import json
+import math
+import logging
+from pathlib import Path
 
-DURATION_TO_FETCH = timedelta(days=1)
+from fetchcarbon import get_rounded_iso_range, get_climate_data
+from scheduling import CarbonScheduler
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+faulthandler.register(signal.SIGQUIT)
+
+app = typer.Typer()
 
 STATES = [
     "PENDING", # 0
@@ -65,7 +82,7 @@ def job_row_to_dict(row):
     return row_dict
 
 def get_jobs(start_window, end_window, by_submit_time=False):
-    creds = dotenv_values(".env")
+    creds = dotenv_values("../.env")
     conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["DB_DATABASE"])
     with conn:
         with conn.cursor(dictionary=True, buffered=False) as cursor:
@@ -139,18 +156,14 @@ def aggregate_jobs(jobs_iter):
         jobs[(start, end)].append(calc_energy_of_job(job))
     return dict(jobs), min_start, max_end
 
-def get_jobs_and_energy(chosen_day):
-    start_time = chosen_day.timestamp()
-    end_time = (chosen_day + DURATION_TO_FETCH).timestamp()
+def get_jobs_and_energy(jobs_list):
+    return aggregate_jobs(jobs_list)
 
-    return aggregate_jobs(get_jobs(start_time, end_time, by_submit_time=False))
-
-def get_jobs_and_energy_reschedule(chosen_day):
-    start_time = chosen_day.timestamp()
-    end_time = (chosen_day + DURATION_TO_FETCH).timestamp()
-
+def get_jobs_and_energy_reschedule(jobs_list, batch_at_this_time=None):
     groups = defaultdict(list)
-    for job in get_jobs(start_time, end_time, by_submit_time=True):
+    for job in jobs_list:
+        if batch_at_this_time is not None:
+            job["time"]["submit"] = batch_at_this_time
         submit_time = datetime.fromtimestamp(job["time"]["submit"])
         submit_group = (submit_time.year, submit_time.month, submit_time.day, submit_time.hour, submit_time.minute)
         groups[submit_group].append(job)
@@ -217,66 +230,153 @@ def get_graph_data(jobs, min_start, max_end):
 
     return periods
 
-def draw_graphs(periods, periods2=None):
+def draw_graphs(periods, periods2=None, num_jobs=None, save_image=True, filename=None, title=""):
     times = [p["time"] for p in periods]
     if periods2 is not None:
         times2 = [p["time"] for p in periods2]
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 6))
     ax1, ax2, ax3, ax4 = axes.flatten()
 
-    ax1.plot(times, [p["energy"] for p in periods])
+    before_color = "tab:red"
+    after_color = "tab:green"
+    neutral_color = "tab:blue"
+
+    ax1.plot(times, [p["energy"] for p in periods], color=before_color)
     if periods2 is not None:
-        ax1.plot(times2, [p["energy"] for p in periods2])
+        ax1.plot(times2, [p["energy"] for p in periods2], color=after_color)
     ax1.set_title("Energy (kWh)")
 
-    ax2.plot(times, [p["jobs"] for p in periods])
+    ax2.plot(times, [p["jobs"] for p in periods], color=before_color)
     if periods2 is not None:
-        ax2.plot(times2, [p["jobs"] for p in periods2])
-    ax2.set_title("Number of jobs")
+        ax2.plot(times2, [p["jobs"] for p in periods2], color=after_color)
+    num_jobs = f" ({num_jobs})" if num_jobs is not None else ""
+    ax2.set_title("Number of jobs" + num_jobs)
 
-    ax3.plot(times, [p["intensity"] for p in periods])
-    if periods2 is not None:
-        ax3.plot(times2, [p["intensity"] for p in periods2])
+    alltimes = times + times2
+    limitstart, limitend = min(alltimes), max(alltimes)
+    grid_intensity = get_climate_data(*get_rounded_iso_range(limitstart.timestamp(), limitend.timestamp()))
+    grid_intensity_xs = [x[0] for x in grid_intensity]
+    grid_intensity_ys = list(grid_intensity.values())
+    ax3.plot(grid_intensity_xs, grid_intensity_ys, color=neutral_color)
     ax3.set_title("Grid carbon intensity (gCO₂/kWh)")
 
-    ax4.plot(times, [p["carbon"] for p in periods])
+    ax4.plot(times, [p["carbon"] for p in periods], color=before_color)
     if periods2 is not None:
-        ax4.plot(times2, [p["carbon"] for p in periods2])
+        ax4.plot(times2, [p["carbon"] for p in periods2], color=after_color)
     ax4.set_title("Job carbon impact (kgCO₂)")
 
-    plt.tight_layout()
-    plt.show()
+    fig.autofmt_xdate()
+    plt.tight_layout(rect=[0, 0.075, 1, 0.95])
+    fig.suptitle(title, fontsize=16, fontweight="bold", y=0.98)
+    subtitle = "\n".join(general_stats(periods, periods2))
+    fig.text(0.5, 0.02, subtitle, ha="center", fontweight="bold", fontsize=12)
 
-def general_stats(periods, custom_comment=""):
-    energy = sum(period["energy"] for period in periods)
-    carbon = sum(period["carbon"] for period in periods)
-    print(f"Total energy {custom_comment}: {energy:.3f} kWh")
-    print(f"Total carbon {custom_comment}: {carbon:.3f} kgCO₂")
+    if save_image:
+        if filename is None:
+            filename = f"{int(datetime.now(timezone.utc).timestamp() * 1000)}.png"
+        plt.savefig(filename, dpi=200)
+    else:
+        plt.show()
+
+def general_stats(periods, periods2=None, return_json=False):
+    # output is either "print", "text" (returns text) or "json" (returns json)
+    energy_2, carbon_2 = False, False
+    if periods2 is None:
+        energy = sum(period["energy"] for period in periods)
+        carbon = sum(period["carbon"] for period in periods)
+        first_text = f"Total energy: {energy:.3f} kWh"
+        second_text = f"Total carbon: {carbon:.3f} kgCO₂"
+    else:
+        energy = sum(period["energy"] for period in periods)
+        energy_2 = sum(period["energy"] for period in periods2)
+        carbon = sum(period["carbon"] for period in periods)
+        carbon_2 = sum(period["carbon"] for period in periods2)
+        if math.isclose(energy, energy_2):
+            first_text = f"Total energy: {energy:.3f} kWh"
+        else:
+            first_text = f"Energy change: {energy:.3f} kWh → {energy_2:.3f} kWh ({energy_2 - energy:+.3f} kWh)"
+        second_text = f"Carbon change: {carbon:.3f} kgCO₂ → {carbon_2:.3f} kgCO₂ ({carbon_2 - carbon:+.3f} kgCO₂)"
+    
+    if return_json:
+        data = {"energy": energy, "carbon": carbon}
+        if periods2 is not None:
+            data |= {"energy_2": energy_2, "carbon_2": carbon_2}
+        return data
+    else:
+        return first_text, second_text
+
+def get_filename_and_title(chosen_day, days_to_fetch, by_submit_time, compare_algorithm):
+    filename = [str(chosen_day.date()), f"{days_to_fetch}d"]
+    if not by_submit_time:
+        filename.append("notbysubmit")
+    if compare_algorithm:
+        filename.append("compare")
+    Path("../graphs").mkdir(parents=True, exist_ok=True)
+    filename = f"../graphs/{'_'.join(filename)}.png"
+    title = [str(chosen_day.date()), f"{days_to_fetch} day{'s' if days_to_fetch != 1 else ''} ahead"]
+    title = ", ".join(title)
+    return filename, title
+
+@app.command()
+def run_main(
+    chosen_day: datetime | None = None,
+    days_to_fetch: int = 1,
+    by_submit_time: bool = True,
+    compare_algorithm: bool = True,
+    show_graph: bool = False,
+    print_json: bool = False,
+    do_ask: bool = True
+):
+    # 2025-11-9, 2026-5-4, 2025-1-9, 2025-2-15
+    choose_random = chosen_day is None
+    duration_to_fetch = timedelta(days=days_to_fetch)
+    if chosen_day is not None:
+        chosen_day = chosen_day.replace(tzinfo=timezone.utc)
+
+    while True:
+        if choose_random:
+            random_timestamp = random.randint(1725608400, 1780351201)
+            random_date = datetime.fromtimestamp(random_timestamp, tz=timezone.utc)
+            random_date = random_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            logger.info("Chosen random date: {random_date}")
+            chosen_day = random_date
+        
+        logger.info("Getting jobs...")
+        start_time = chosen_day.timestamp()
+        end_time = (chosen_day + duration_to_fetch).timestamp()
+        jobs_list = list(get_jobs(start_time, end_time, by_submit_time))
+        jobs, min_start, max_end = get_jobs_and_energy(jobs_list)
+        num_jobs = sum(len(group) for group in jobs.values())
+        logger.info(f"Total number of jobs: {num_jobs}")
+        if not print_json and do_ask:
+            input("Press enter to continue...")
+        if num_jobs == 0:
+            if choose_random:
+                continue
+            else:
+                quit()
+        periods = get_graph_data(jobs, min_start, max_end)
+        break
+
+    graph_filename, title = get_filename_and_title(chosen_day, days_to_fetch, by_submit_time, compare_algorithm)
+    save_image = not show_graph
+
+    result_json = {"num_jobs": num_jobs, "chosen_day": chosen_day.isoformat(), "days_to_fetch": days_to_fetch}
+    if compare_algorithm:
+        logger.info("Running alternative scheduling algorithm...")
+        jobs2, min_start2, max_end2 = get_jobs_and_energy_reschedule(jobs_list)
+        periods2 = get_graph_data(jobs2, min_start2, max_end2)
+    else:
+        periods2 = None
+    draw_graphs(periods, periods2, num_jobs=num_jobs, save_image=save_image, filename=graph_filename, title=title)
+    stats = general_stats(periods, periods2, return_json=print_json)
+    
+    if not print_json:
+        print("\n".join(stats))
+    else:
+        result_json |= stats
+        print(json.dumps(result_json))
 
 if __name__ == "__main__":
-    choose_random = False
-    if choose_random:
-        random_timestamp = random.randint(1725608400, 1780351201)
-        random_date = datetime.fromtimestamp(random_timestamp, tz=timezone.utc)
-        random_date = random_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        print(random_date)
-        chosen_day = random_date
-    else:
-        chosen_day = datetime(2025, 11, 9, tzinfo=timezone.utc)
-        # chosen_day = datetime(2026, 5, 4, tzinfo=timezone.utc)
-    
-    jobs, min_start, max_end = get_jobs_and_energy(chosen_day)
-    print(f"Total number of jobs: {sum(len(group) for group in jobs.values())}")
-    periods = get_graph_data(jobs, min_start, max_end)
-
-    compare_algorithm = True
-    if compare_algorithm:
-        jobs2, min_start2, max_end2 = get_jobs_and_energy_reschedule(chosen_day)
-        periods2 = get_graph_data(jobs2, min_start2, max_end2)
-        draw_graphs(periods, periods2)
-        general_stats(periods, "prior")
-        general_stats(periods2, "after")
-    else:
-        draw_graphs(periods)
-        general_stats(periods)
+    app()

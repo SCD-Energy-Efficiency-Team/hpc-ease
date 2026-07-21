@@ -1,6 +1,7 @@
 *.json
 *.jsonl
 *.txt
+*.png
 
 *.db
 *.db-shm
