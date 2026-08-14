@@ -1,20 +1,21 @@
 import faulthandler
-import signal
-from dotenv import dotenv_values
-from datetime import datetime, timezone, timedelta
-import matplotlib.pyplot as plt
-import mariadb
-from collections import defaultdict
-from tqdm import tqdm
-import random
-import typer
 import json
-import math
 import logging
+import math
+import random
+import signal
+import sys
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
-from fetchcarbon import get_rounded_iso_range, get_climate_data
+import typer
+from fetchcarbon import CarbonIntensityCSV as CarbonIntensityService
+from fetchcarbon import get_rounded_iso_range
+from fetchjobs import get_jobs_from_db, get_jobs_from_parquet
 from scheduling import CarbonScheduler
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -26,99 +27,6 @@ logger.setLevel(logging.DEBUG)
 faulthandler.register(signal.SIGQUIT)
 
 app = typer.Typer()
-
-STATES = [
-    "PENDING", # 0
-    "RUNNING", # 1
-    "SUSPENDED", # 2
-    "COMPLETED", # 3
-    "CANCELLED", # 4
-    "FAILED", # 5
-    "TIMEOUT", # 6
-    None,
-    None,
-    None,
-    None,
-    "NODE_FAIL", # 11
-]
-
-TRES_KEYS = {
-    1: "cpu",
-    2: "mem",
-    3: "energy",
-    4: "node",
-    5: "billing",
-    6: "disk",
-    7: "vmem",
-    8: "pages",
-    1001: "gpu",
-    1002: "gpumem",
-    1003: "gpuutil",
-    1004: "gpu:a100",
-    1005: "gpu:a100_1g.10gb",
-    1006: "gpu:1g.10gb"
-}
-
-def job_row_to_dict(row):
-    time_dict = {}
-    time_dict["start"] = row.pop("time_start")
-    time_dict["end"] = row.pop("time_end")
-    time_dict["elapsed"] = time_dict["end"] - time_dict["start"]
-    time_dict["submit"] = row.pop("time_submit")
-    time_dict["total"] = row.pop("total_cpu_time")
-    row_dict = {"time": time_dict, "alloc": {}, "req": {}}
-    for line in row["tres_alloc"].split(","):
-        key, value = tuple(map(int, line.split("=")))
-        row_dict["alloc"][TRES_KEYS[key]] = value
-    for line in row["tres_req"].split(","):
-        key, value = tuple(map(int, line.split("=")))
-        row_dict["req"][TRES_KEYS[key]] = value
-    del row["tres_alloc"], row["tres_req"]
-    row_dict["state"] = STATES[row.pop("state")]
-    row_dict["job_db_inx"] = row.pop("job_db_inx")
-    row_dict["timelimit"] = row.pop("timelimit")
-    row_dict["id_job"] = row.pop("id_job")
-    assert row == {}
-    return row_dict
-
-def get_jobs(start_window, end_window, by_submit_time=False):
-    creds = dotenv_values("../.env")
-    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["DB_DATABASE"])
-    with conn:
-        with conn.cursor(dictionary=True, buffered=False) as cursor:
-            if not by_submit_time:
-                where_clause = "job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s AND job_table.state = 3"
-            else:
-                where_clause = "job_table.time_submit >= %s AND job_table.time_submit <= %s AND job_table.state = 3"
-            query = f"""
-                SELECT
-                    job_table.job_db_inx AS job_db_inx,  
-                    job_table.id_job AS id_job,
-                    job_table.state AS state,
-                    job_table.time_start AS time_start,
-                    job_table.time_end AS time_end,
-                    job_table.time_submit AS time_submit,
-                    job_table.tres_alloc AS tres_alloc,
-                    job_table.tres_req AS tres_req,
-                    job_table.timelimit AS timelimit,
-                    CAST(SUM(step_table.user_sec + step_table.sys_sec + (step_table.sys_usec / 1000000) + (step_table.user_usec / 1000000)) AS DECIMAL(18, 6)) AS total_cpu_time
-                FROM 
-                    {creds["JOB_TABLE"]} job_table
-                JOIN 
-                    {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
-                WHERE
-                    {where_clause}
-                GROUP BY 
-                    job_table.job_db_inx
-            """
-
-            if not by_submit_time:
-                cursor.execute(query, (start_window, end_window, start_window))
-            else:
-                cursor.execute(query, (start_window, end_window))
-
-            for row in cursor:
-                yield job_row_to_dict(row)
 
 def calc_energy_of_job(job, p_idle=220, p_max=850):
     elapsed_time = job["time"]["elapsed"]  # wall clock time
@@ -150,27 +58,23 @@ def aggregate_jobs(jobs_iter):
     min_start, max_end = float("inf"), float("-inf")
     for job in jobs_iter:
         state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
-        assert start != 0 and end != 0, f"{job['job_id']} {state} {start} {end}"
+        assert start != 0 and end != 0, f"{job['id_job']} {state} {start} {end}"
         min_start = min(min_start, start)
         max_end = max(max_end, end)
         jobs[(start, end)].append(calc_energy_of_job(job))
     return dict(jobs), min_start, max_end
 
-def get_jobs_and_energy(jobs_list):
-    return aggregate_jobs(jobs_list)
+def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file):
+    return aggregate_jobs(get_jobs(start_time, end_time, jobs_file, by_submit_time))
 
-def get_jobs_and_energy_reschedule(jobs_list, batch_at_this_time=None):
-    groups = defaultdict(list)
-    for job in jobs_list:
-        if batch_at_this_time is not None:
-            job["time"]["submit"] = batch_at_this_time
-        submit_time = datetime.fromtimestamp(job["time"]["submit"])
-        submit_group = (submit_time.year, submit_time.month, submit_time.day, submit_time.hour, submit_time.minute)
-        groups[submit_group].append(job)
-    scheduler = CarbonScheduler()
-    for key in tqdm(sorted(groups)):
-        scheduler.process_jobs(groups[key])
-
+def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice):
+    scheduler = CarbonScheduler(cidservice)
+    total_steps = math.ceil((end_time - start_time) / 60)
+    bar = tqdm(range(total_steps), disable=None, unit="min")
+    for step in bar:
+        current = start_time + step * 60
+        scheduler.process_jobs(get_jobs(current, current + 60, jobs_file, by_submit_time))
+        bar.set_postfix(jobs=scheduler.jobs_seen)
     return aggregate_jobs(scheduler.output_jobs())
 
 def iter_periods(startv, endv, minutes=5):
@@ -203,9 +107,9 @@ def accum_job_over_window(jobs, startv, endv):
     
     return energy_total, jobs_total
 
-def get_graph_data(jobs, min_start, max_end):
+def get_graph_data(jobs, min_start, max_end, cidservice):
     limitstart, limitend = get_rounded_iso_range(min_start, max_end)
-    carbon_intensity = get_climate_data(limitstart, limitend, "OX11", "forecast")
+    carbon_intensity = cidservice.get_climate_data(limitstart, limitend, "OX11", "forecast")
 
     periods = []
     limitstart, limitend = datetime.fromisoformat(limitstart), datetime.fromisoformat(limitend)
@@ -230,7 +134,9 @@ def get_graph_data(jobs, min_start, max_end):
 
     return periods
 
-def draw_graphs(periods, periods2=None, num_jobs=None, save_image=True, filename=None, title=""):
+def draw_graphs(cidservice, periods, periods2=None, num_jobs=None, save_image=True, filename=None, title=""):
+    import matplotlib.pyplot as plt
+
     times = [p["time"] for p in periods]
     if periods2 is not None:
         times2 = [p["time"] for p in periods2]
@@ -255,7 +161,7 @@ def draw_graphs(periods, periods2=None, num_jobs=None, save_image=True, filename
 
     alltimes = times + times2
     limitstart, limitend = min(alltimes), max(alltimes)
-    grid_intensity = get_climate_data(*get_rounded_iso_range(limitstart.timestamp(), limitend.timestamp()))
+    grid_intensity = cidservice.get_climate_data(*get_rounded_iso_range(limitstart.timestamp(), limitend.timestamp()))
     grid_intensity_xs = [x[0] for x in grid_intensity]
     grid_intensity_ys = list(grid_intensity.values())
     ax3.plot(grid_intensity_xs, grid_intensity_ys, color=neutral_color)
@@ -274,7 +180,7 @@ def draw_graphs(periods, periods2=None, num_jobs=None, save_image=True, filename
 
     if save_image:
         if filename is None:
-            filename = f"{int(datetime.now(timezone.utc).timestamp() * 1000)}.png"
+            filename = f"{int(datetime.now(UTC).timestamp() * 1000)}.png"
         plt.savefig(filename, dpi=200)
     else:
         plt.show()
@@ -318,35 +224,49 @@ def get_filename_and_title(chosen_day, days_to_fetch, by_submit_time, compare_al
     title = ", ".join(title)
     return filename, title
 
+class GraphMode(str, Enum):
+    no_graph = "no-graph"
+    save_graph = "save-graph"
+    show_graph = "show-graph"
+
 @app.command()
 def run_main(
     chosen_day: datetime | None = None,
     days_to_fetch: int = 1,
     by_submit_time: bool = True,
     compare_algorithm: bool = True,
-    show_graph: bool = False,
+    graph_mode: GraphMode = GraphMode.save_graph,
     print_json: bool = False,
-    do_ask: bool = True
+    do_ask: bool = True,
+    jobs_file: str | None = None
 ):
-    # 2025-11-9, 2026-5-4, 2025-1-9, 2025-2-15
+    # 2025-11-9 (16373), 2026-5-4 (89424), 2025-1-9 (7850), 2025-2-15 (2344)
     choose_random = chosen_day is None
     duration_to_fetch = timedelta(days=days_to_fetch)
     if chosen_day is not None:
-        chosen_day = chosen_day.replace(tzinfo=timezone.utc)
+        chosen_day = chosen_day.replace(tzinfo=UTC)
+
+    cidservice = CarbonIntensityService()
+
+    print(" ".join(sys.argv))
+
+    if jobs_file:
+        get_jobs = get_jobs_from_parquet
+    else:
+        get_jobs = get_jobs_from_db
 
     while True:
         if choose_random:
             random_timestamp = random.randint(1725608400, 1780351201)
-            random_date = datetime.fromtimestamp(random_timestamp, tz=timezone.utc)
+            random_date = datetime.fromtimestamp(random_timestamp, tz=UTC)
             random_date = random_date.replace(hour=0, minute=0, second=0, microsecond=0)
-            logger.info("Chosen random date: {random_date}")
+            logger.info(f"Chosen random date: {random_date}")
             chosen_day = random_date
         
         logger.info("Getting jobs...")
         start_time = chosen_day.timestamp()
         end_time = (chosen_day + duration_to_fetch).timestamp()
-        jobs_list = list(get_jobs(start_time, end_time, by_submit_time))
-        jobs, min_start, max_end = get_jobs_and_energy(jobs_list)
+        jobs, min_start, max_end = get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file)
         num_jobs = sum(len(group) for group in jobs.values())
         logger.info(f"Total number of jobs: {num_jobs}")
         if not print_json and do_ask:
@@ -355,21 +275,25 @@ def run_main(
             if choose_random:
                 continue
             else:
-                quit()
-        periods = get_graph_data(jobs, min_start, max_end)
+                break
+        periods = get_graph_data(jobs, min_start, max_end, cidservice)
         break
 
     graph_filename, title = get_filename_and_title(chosen_day, days_to_fetch, by_submit_time, compare_algorithm)
-    save_image = not show_graph
+    save_image = graph_mode == GraphMode.save_graph
 
     result_json = {"num_jobs": num_jobs, "chosen_day": chosen_day.isoformat(), "days_to_fetch": days_to_fetch}
+    if num_jobs == 0:
+        print(json.dumps(result_json))
+        sys.exit()
     if compare_algorithm:
         logger.info("Running alternative scheduling algorithm...")
-        jobs2, min_start2, max_end2 = get_jobs_and_energy_reschedule(jobs_list)
-        periods2 = get_graph_data(jobs2, min_start2, max_end2)
+        jobs2, min_start2, max_end2 = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice)
+        periods2 = get_graph_data(jobs2, min_start2, max_end2, cidservice)
     else:
         periods2 = None
-    draw_graphs(periods, periods2, num_jobs=num_jobs, save_image=save_image, filename=graph_filename, title=title)
+    if graph_mode != GraphMode.no_graph:
+        draw_graphs(cidservice, periods, periods2, num_jobs=num_jobs, save_image=save_image, filename=graph_filename, title=title)
     stats = general_stats(periods, periods2, return_json=print_json)
     
     if not print_json:

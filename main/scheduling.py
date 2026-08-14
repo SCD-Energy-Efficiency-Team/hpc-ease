@@ -1,8 +1,11 @@
-from datetime import datetime, timedelta
-from fetchcarbon import yield_lowest_periods
 from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from functools import cmp_to_key
-from tqdm import tqdm
+
+
+class VirtualCapacityExhausted(Exception):
+    pass
+
 
 class Node:
     def __init__(self):
@@ -29,10 +32,10 @@ class Node:
                         return False
         return True
     
-    def assign(self, job, time_start, time_end=None):
+    def assign(self, job, time_start, time_end=None, skip_check=False):
         if time_end is None:
             time_end = time_start + timedelta(minutes=job["timelimit"])
-        if self.can_assign(job, time_start, time_end):
+        if skip_check or self.can_assign(job, time_start, time_end):
             self.jobs[(time_start, time_end)].append(job)
             return True
         return False
@@ -47,27 +50,33 @@ def job_comparator(a, b):
     return job_footprint(b) - job_footprint(a)
 
 class CarbonScheduler:
-    def __init__(self):
+    def __init__(self, cidservice):
         self.NUM_NODES = 255
         self.nodes = [Node() for node in range(self.NUM_NODES)]
-    
+        self.cidservice = cidservice
+        self.jobs_seen = 0
+
     def process_jobs(self, jobs):
         jobs = sorted(jobs, key=cmp_to_key(job_comparator))
-        for job in tqdm(jobs, leave=False):
-            assert job["req"]["node"] == 1
-            submit_time = datetime.fromtimestamp(job["time"]["submit"])
-            windows = yield_lowest_periods(submit_time, job["timelimit"])
-            node_index = 0
-            while True:
-                assigned = False
+        for job in jobs:
+            self.jobs_seen += 1
+            num_nodes_req = job["req"]["node"]
+            submit_time = datetime.fromtimestamp(job["time"]["submit"], tz=UTC)
+            windows = self.cidservice.yield_lowest_periods(submit_time, job["timelimit"])
+            available = []
+            for node_index, node in enumerate(self.nodes):
                 for _, window_start, window_end in windows:
-                    if self.nodes[node_index].assign(job, window_start, window_end):
-                        assigned = True
+                    if node.can_assign(job, window_start, window_end):
+                        available.append(node_index)
                         break
-                if assigned:
+                if len(available) == num_nodes_req:
                     break
-                else:
-                    node_index += 1
+            if len(available) != num_nodes_req:
+                raise VirtualCapacityExhausted(
+                    f"Only {len(available)} of {num_nodes_req} nodes available for job {job['id_job']}"
+                )
+            for node_index in available:
+                node.assign(job, window_start, window_end, skip_check=True)
     
     def output_jobs(self):
         for node in self.nodes:
