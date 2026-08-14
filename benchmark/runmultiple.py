@@ -1,21 +1,27 @@
-from datetime import datetime, timedelta
-import os
-import subprocess
 import io
-import pandas as pd
 import json
-import typer
+import os
 import random
-from enum import Enum
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Annotated
 
-TS_BINARY = "../../task-spooler/ts"
-CUSTOM_SOCKET = "/tmp/carboncoding.socket"
+import pandas as pd
+import typer
+from tqdm import tqdm
+
+project_root = Path(__file__).resolve().parent.parent
 
 app = typer.Typer()
 
 def get_days():
     start_range, end_range = 1725608400, 1780351201
-    start_range, end_range = datetime.fromtimestamp(start_range), datetime.fromtimestamp(end_range)
+    start_range, end_range = datetime.fromtimestamp(start_range, tz=UTC), datetime.fromtimestamp(end_range, tz=UTC)
     start_window = start_range.replace(hour=0, minute=0, second=0, microsecond=0)
     days = []
     while start_window < end_range:
@@ -23,92 +29,248 @@ def get_days():
         start_window += timedelta(days=1)
     return days
 
-def run_ts(params, get_output=False):
-    # TS_SOCKET=/tmp/carboncoding.socket ../../task-spooler/ts
-    env = os.environ.copy()
-    env["TS_SOCKET"] = CUSTOM_SOCKET
-    cmd = [TS_BINARY] + params
-    if not get_output:
-        subprocess.run(cmd, env=env)
-    else:
-        output = subprocess.run(cmd, env=env, capture_output=True, text=True).stdout
-        return output
+class TaskSpooler:
+    def __init__(self):
+        self.TS_BINARY = project_root.parent / "task-spooler/ts"
 
-def submit(day_string):
-    env = os.environ.copy()
-    env["TS_SOCKET"] = CUSTOM_SOCKET
+    def run_cmd(self, params, get_output=False):
+        cmd = [self.TS_BINARY] + params
+        if not get_output:
+            subprocess.run(cmd, check=False)
+        else:
+            output = subprocess.run(cmd, capture_output=True, text=True, check=False).stdout
+            return output
 
-    time_part = ["/usr/bin/time", "-f", '{"exit_code":%x,"max_ram_kb":%M,"user_time_sec":%U,"sys_time_sec":%S,"elapsed_sec":%e}']
-    python_part = ["../.venv/bin/python3", "../main/process.py", "--print-json", "--chosen-day", day_string]
-    cmd = [TS_BINARY] + time_part + python_part
+    def submit(self, day_string, days_to_fetch, project_folder, jobs_file=None):
+        time_part = ["/usr/bin/time", "-f", '{"exit_code":%x,"max_ram_kib":%M,"user_time_sec":%U,"sys_time_sec":%S,"elapsed_sec":%e}']
+        python_part = [
+            str(project_folder / ".venv/bin/python3"),
+            str(project_folder / "main/process.py"),
+            "--print-json", "--graph-mode", "no-graph",
+            "--chosen-day", day_string,
+            "--days-to-fetch", str(days_to_fetch)
+        ]
+        if jobs_file is not None:
+            python_part.extend(["--jobs-file", str(jobs_file.resolve())])
+        cmd = [self.TS_BINARY] + time_part + python_part
 
-    try:
-        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, check=True)
+        try:
+            output = subprocess.run(cmd, capture_output=True, text=True, check=False).stdout
+            return int(output.strip())
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to queue job: {e.stderr}")
+        
+        time.sleep(0.01)
+
+    def get_outputs(self, job_ids, filename):
+        output = self.run_cmd(["-l"], get_output=True)
+        df = pd.read_fwf(io.StringIO(output), infer_nrows=10000)
+        finished_tasks = df[(df["State"] == "finished")]
+        keys = ["ID", "State", "E-Level", "Time"]
+        with open(filename, "a") as logfile:
+            for index, row in finished_tasks.iterrows():
+                rowdict = {key: row[key] for key in keys}
+                if rowdict["ID"] in job_ids:
+                    if row["Output"] == "(...)":
+                        continue
+                    with open(row["Output"]) as file:
+                        content = file.read()
+                    rowdict["Output"] = content
+                    logfile.write(json.dumps(rowdict)+"\n")
+                    self.run_cmd(["-r", str(rowdict["ID"])])
+
+    def check_queue(self, job_ids):
+        lines = self.run_cmd(["-l"], get_output=True).splitlines()[1:]
+        active_count = 0
+        for line in lines:
+            job_id, state = " ".join(line.split()).split(" ")[0:2]
+            job_id = int(job_id)
+            if job_id in job_ids and state in ["running", "queued"]:
+                active_count += 1
+        return active_count
+
+class Slurm:
+    def __init__(self):
+        pass
+
+    def submit(self, day_string, days_to_fetch, project_folder, jobs_file=None):
+        assert jobs_file is not None, "get_from_db should not work on Slurm"
+        partition = "standard" # "standard" "debug"
+        qos = "standard" # "standard" "debug"
+        duration = "12:00:00" # "01:00:00" "24:00:00"
+        mem = "4G" # "1G" "4G"
+        slurm_part = [
+            "sbatch", "-A", "no-project",
+            "-p", partition, "-q", qos, "-t", duration, f"--mem={mem}",
+            "-N", "1", "-c", "1",
+            "-o", "slurmoutputs/job_%j.log"
+        ]
+        time_part = ["/usr/bin/time", "-f", '{"exit_code":%x,"max_ram_kib":%M,"user_time_sec":%U,"sys_time_sec":%S,"elapsed_sec":%e}']
+        python_part = [
+            str(project_folder / ".venv/bin/python3"),
+            str(project_folder / "main/process.py"),
+            "--print-json", "--graph-mode", "no-graph",
+            "--chosen-day", day_string, "--days-to-fetch", str(days_to_fetch), "--jobs-file", str(jobs_file.resolve())
+        ]
+        wrap_part = shlex.join(time_part + python_part)
+        cmd = slurm_part + [f"--wrap={wrap_part}"]
+
+        try:
+            process = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            output = process.stdout.strip()
+            return int(output.split(" ")[-1])
+        except subprocess.CalledProcessError as e:
+            raise Exception(f"Failed to queue job: {e.stderr}")
+
+    def get_outputs(self, job_ids, filename):
+        with open(filename, "a") as logfile:
+            for job_id in job_ids:
+                output = subprocess.run(["sacct", "-j", str(job_id), "-X", "--format=JobID,State,ExitCode,Elapsed"], capture_output=True, text=True, check=False).stdout
+                line = output.strip().split("\n")[-1].strip()
+                job_id_from_slurm, state, elevel, time = " ".join(line.split()).split(" ")
+                assert job_id_from_slurm == str(job_id)
+                rowdict = {"ID": job_id, "State": state, "E-Level": elevel, "Time": time}
+                with open(f"slurmoutputs/job_{job_id}.log") as file:
+                    content = file.read()
+                rowdict["Output"] = content
+                logfile.write(json.dumps(rowdict)+"\n")
+        for job_id in job_ids:
+            os.remove(f"slurmoutputs/job_{job_id}.log")
+
+    def check_queue(self, job_ids):   
+        lines = subprocess.run(["squeue", "--me"], capture_output=True, text=True, check=False).stdout.splitlines()[1:]
+        active_count = 0
+        for line in lines:
+            job_id = " ".join(line.split()).split(" ")[0]
+            job_id = int(job_id)
+            if job_id in job_ids:
+                active_count += 1
+        return active_count
+
+def make_snapshot(snapshots_root):
+    snapshots_root.mkdir(exist_ok=True)
+    start = time.time()
+    while True:
+        snap = snapshots_root / f"snap-{datetime.now(UTC):%Y%m%dT%H%M%S}-{random.randint(0, 0xFFFFFFFF):08x}"
+        if not snap.is_dir():
+            break
+        if (time.time() - start) > 10:
+            raise Exception("Creating a snapshot folder took too long?")
+
+    patterns = [
+        "__pycache__", ".git", ".venv",
+        "*.pyc", "*.parquet", "*.png",
+        "carbondata.db", "uv.lock"
+    ]
+
+    print("Creating snapshot folder...")
+    shutil.copytree(
+        project_root,
+        snap,
+        ignore=shutil.ignore_patterns(*patterns),
+    )
+
+    try:       
+        subprocess.run(
+            ["uv", "sync"], 
+            cwd=snap,
+            check=True,
+            capture_output=True,
+            text=True 
+        )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to queue job: {e.stderr}")
+        print(f"\nERROR: 'uv sync' failed with exit code {e.returncode}\n{e.stderr.strip()}\n", file=sys.stderr)
+        raise Exception("uv sync failed")
 
-def get_ts_outputs():
-    output = run_ts(["-l"], get_output=True)
-    df = pd.read_fwf(io.StringIO(output), infer_nrows=10000)
-    finished_tasks = df[(df["State"] == "finished")]
-    keys = ["ID", "State", "E-Level", "Time"]
-    with open("tsdonejobs.txt", "a") as logfile:
-        for index, row in finished_tasks.iterrows():
-            rowdict = {key: row[key] for key in keys}
-            with open(row["Output"]) as file:
-                content = file.read()
-            rowdict["Output"] = content
-            logfile.write(json.dumps(rowdict)+"\n")
-            run_ts(["-r", str(rowdict["ID"])])
-
-class Mode(str, Enum):
-    grab_only = "grab-only"
-    grab_and_kill = "grab-and-kill"
-    full_run = "full-run"
+    print(f"Snapshot folder {snap} created.")
+    return snap
 
 @app.command()
 def run_main(
-    mode: Mode = Mode.grab_only,
-    test_dates: bool = False,
-):
-    """
-    with open("tsdonejobs.txt") as file:
-        for line in file:
-            line = json.loads(line)
-            if line["ID"] == 82:
-                print(line["Output"])
-    quit()
-    """
-
-    if test_dates and mode != Mode.full_run:
-        raise typer.BadParameter(
-            f"When --test-dates is enabled, --mode must be '{Mode.full_run.value}'."
+    test_dates: bool = True,
+    only_one_day: bool = True,
+    jobs_file: Annotated[
+        Path | None, 
+        typer.Option(
+            exists=True, 
+            file_okay=True, 
+            dir_okay=False, 
+            readable=True, 
+            resolve_path=True
         )
+    ] = None,
+    use_slurm: bool = False,
+    debug: bool = False,
+):
+    if not use_slurm:
+        jobscheduler = TaskSpooler()
+    else:
+        assert jobs_file is not None, "get_from_db should not work on Slurm"
+        jobscheduler = Slurm()
 
-    get_ts_outputs()
-    if mode == Mode.grab_only:
-        quit()
-    
-    input("Press enter to kill previous ts server...")
-    run_ts(["-C"]) # Clear finished jobs from list
-    run_ts(["-T"]) # Stops all running jobs
-    run_ts(["-K"]) # Kills the ts server
-    run_ts(["-S", "14"]) # Sets the ts server to run x jobs concurrently
-    if mode == Mode.grab_and_kill:
-        quit()
+    combos = []
 
-    count = 0
+    if only_one_day:
+        days_to_fetch_list = [1]
+    else:
+        days_to_fetch_list = [1, 2, 4, 7]
+
     if test_dates:
-        for date in ["2025-11-9", "2026-5-4", "2025-1-9", "2025-2-15"]:
-            submit(date)
-            count += 1
+        with open("dates.txt") as file:
+            dates = file.read().strip().split("\n")
     else:
         days = get_days()
-        random.shuffle(days)
-        for day in days:
-            submit(day.date().isoformat())
-            count += 1
-    print(f"Submitted {count} jobs")
+        dates = [day.date().isoformat() for day in days]
+    if debug:
+        print(f"As debugging, ignored {len(dates)}, using 2025-2-15 instead")
+        dates = ["2025-2-15"]
+    random.shuffle(dates)
+
+    snapshot_folder = make_snapshot(Path("/home/users/jamesrav/cprojsnaps"))
+
+    # db_folder = Path(project_root) / "dbexports"
+    # db_folder = Path("/work/scratch-pw5/jamesrav") / "dbexports"
+    for days_to_fetch in days_to_fetch_list:
+        for date in dates:
+            combos.append((date, days_to_fetch, snapshot_folder, jobs_file))
+
+    if debug:
+        print(f"As debugging, reduced {len(combos)} down to 1")
+        combos = [combos[0]]
+    random.shuffle(combos)
+
+    if not use_slurm:
+        num_workers = jobscheduler.run_cmd(["-S"], get_output=True).strip()
+        print(f"Number of workers is {num_workers}")
+        print(f"Change with {jobscheduler.TS_BINARY} -S insert_num_workers_here")
+
+    if sys.stdin.isatty():
+        input(f"Will submit {len(combos)} jobs. Press enter to continue...")
+
+    job_ids = []
+    for combo in tqdm(combos, mininterval=0):
+        job_ids.append(jobscheduler.submit(*combo))
+
+    total_jobs = len(combos)
+    print(f"Submitted {total_jobs} jobs, waiting for them to finish...")
+
+    with tqdm(total=total_jobs) as pbar:
+        while True:
+            num_jobs = jobscheduler.check_queue(job_ids)
+            pbar.n = total_jobs - num_jobs
+            pbar.refresh()
+            if num_jobs == 0:
+                break
+            time.sleep(5)
+    
+    shutil.rmtree(snapshot_folder)
+
+    print("Gathering results...")
+    while True:
+        random_filename = f"temp/{int(time.time()*1000)!s}.txt"
+        if not os.path.isfile(random_filename):
+            break
+    jobscheduler.get_outputs(job_ids, random_filename)
 
 if __name__ == "__main__":
     app()
