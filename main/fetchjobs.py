@@ -1,0 +1,194 @@
+try:
+    import mariadb
+except ImportError as e:
+    pass
+    # print(f"WARNING: Failed to import MariaDB, may cause crash if required... ({e})")
+
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+from dotenv import dotenv_values
+
+STATES = [
+    "PENDING", # 0
+    "RUNNING", # 1
+    "SUSPENDED", # 2
+    "COMPLETED", # 3
+    "CANCELLED", # 4
+    "FAILED", # 5
+    "TIMEOUT", # 6
+    None,
+    None,
+    None,
+    None,
+    "NODE_FAIL", # 11
+]
+
+TRES_KEYS = {
+    1: "cpu",
+    2: "mem",
+    3: "energy",
+    4: "node",
+    5: "billing",
+    6: "disk",
+    7: "vmem",
+    8: "pages",
+    1001: "gpu",
+    1002: "gpumem",
+    1003: "gpuutil",
+    1004: "gpu:a100",
+    1005: "gpu:a100_1g.10gb",
+    1006: "gpu:1g.10gb"
+}
+
+def job_row_to_dict(row):
+    time_dict = {}
+    time_dict["start"] = row.pop("time_start")
+    time_dict["end"] = row.pop("time_end")
+    time_dict["elapsed"] = time_dict["end"] - time_dict["start"]
+    time_dict["submit"] = row.pop("time_submit")
+    time_dict["total"] = float(row.pop("total_cpu_time"))
+    row_dict = {"time": time_dict, "alloc": {}, "req": {}}
+    for line in row["tres_alloc"].split(","):
+        key, value = tuple(map(int, line.split("=")))
+        row_dict["alloc"][TRES_KEYS[key]] = value
+    for line in row["tres_req"].split(","):
+        key, value = tuple(map(int, line.split("=")))
+        row_dict["req"][TRES_KEYS[key]] = value
+    del row["tres_alloc"], row["tres_req"]
+    row_dict["state"] = STATES[row.pop("state")]
+    row_dict["job_db_inx"] = row.pop("job_db_inx")
+    row_dict["timelimit"] = row.pop("timelimit")
+    row_dict["id_job"] = row.pop("id_job")
+    assert row == {}
+    return row_dict
+
+###
+
+def get_jobs_from_db_old(start_window, end_window, by_submit_time=True):
+    creds = dotenv_values("../.env")
+    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["MAIN_DATABASE"])
+    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
+        if by_submit_time:
+            where_clause = "job_table.time_submit >= %s AND job_table.time_submit < %s AND job_table.state = 3"
+        else:
+            where_clause = "job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s AND job_table.state = 3"
+        
+        query = f"""
+            SELECT
+                job_table.job_db_inx AS job_db_inx,  
+                job_table.id_job AS id_job,
+                job_table.state AS state,
+                job_table.time_start AS time_start,
+                job_table.time_end AS time_end,
+                job_table.time_submit AS time_submit,
+                job_table.tres_alloc AS tres_alloc,
+                job_table.tres_req AS tres_req,
+                job_table.timelimit AS timelimit,
+                CAST(SUM((step_table.user_sec * 1000000) + step_table.user_usec + (step_table.sys_sec * 1000000) + step_table.sys_usec) AS DECIMAL(65, 6)) / 1000000 AS total_cpu_time
+            FROM 
+                {creds["JOB_TABLE"]} job_table
+            JOIN 
+                {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
+            WHERE
+                {where_clause}
+            GROUP BY 
+                job_table.job_db_inx
+            ORDER BY
+                job_table.job_db_inx ASC
+        """
+
+        if by_submit_time:
+            cursor.execute(query, (start_window, end_window))
+        else:
+            cursor.execute(query, (start_window, end_window, start_window))
+
+        for row in cursor:
+            yield job_row_to_dict(row)
+
+def get_all_jobs_old():
+    creds = dotenv_values("../.env")
+    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["MAIN_DATABASE"])
+    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
+        query = f"""
+            SELECT
+                job_table.job_db_inx AS job_db_inx,  
+                job_table.id_job AS id_job,
+                job_table.state AS state,
+                job_table.time_start AS time_start,
+                job_table.time_end AS time_end,
+                job_table.time_submit AS time_submit,
+                job_table.tres_alloc AS tres_alloc,
+                job_table.tres_req AS tres_req,
+                job_table.timelimit AS timelimit,
+                CAST(SUM((step_table.user_sec * 1000000) + step_table.user_usec + (step_table.sys_sec * 1000000) + step_table.sys_usec) AS DECIMAL(65, 6)) / 1000000 AS total_cpu_time
+            FROM 
+                {creds["JOB_TABLE"]} job_table
+            JOIN 
+                {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
+            WHERE
+                job_table.state = 3
+            GROUP BY 
+                job_table.job_db_inx
+            ORDER BY
+                job_table.job_db_inx ASC
+        """
+
+        cursor.execute(query)
+
+        for row in cursor:
+            yield job_row_to_dict(row)
+
+###
+
+def get_all_jobs():
+    creds = dotenv_values("../.env")
+    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["PROCESSED_DATABASE"])
+    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
+        query = f"SELECT * FROM {creds['PROCESSED_TABLE']}"
+        cursor.execute(query)
+        for row in cursor:
+            yield job_row_to_dict(row)
+
+def get_all_jobs_from_parquet(filename):
+    dataset = ds.dataset(filename, format="parquet")
+    scanner = dataset.scanner()
+    for record_batch in scanner.to_batches():
+        yield from record_batch.to_pylist()
+
+def get_jobs_from_db(start_window, end_window, jobs_file=None, by_submit_time=True):
+    assert by_submit_time, "Shouldn't be using start and end time"
+    creds = dotenv_values("../.env")
+    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["PROCESSED_DATABASE"])
+    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
+        if by_submit_time:
+            where_clause = "job_table.time_submit >= %s AND job_table.time_submit < %s"
+        else:
+            where_clause = "job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s"
+        
+        query = f"""
+            SELECT
+                *
+            FROM 
+                {creds["PROCESSED_TABLE"]} job_table
+            WHERE
+                {where_clause}
+            ORDER BY
+                job_table.job_db_inx ASC
+        """
+
+        if by_submit_time:
+            cursor.execute(query, (start_window, end_window))
+        else:
+            cursor.execute(query, (start_window, end_window, start_window))
+
+        for row in cursor:
+            yield job_row_to_dict(row)
+
+def get_jobs_from_parquet(start_window, end_window, filename, by_submit_time=True):
+    assert by_submit_time, "Shouldn't be using start and end time"
+    start_window, end_window = int(start_window), int(end_window)
+    dataset = ds.dataset(filename, format="parquet")
+    time_filter = (pc.field(("time", "submit")) >= start_window) & (pc.field(("time", "submit")) < end_window)
+    scanner = dataset.scanner(filter=time_filter)
+    for record_batch in scanner.to_batches():
+        yield from record_batch.to_pylist()

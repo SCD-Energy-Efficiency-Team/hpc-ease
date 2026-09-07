@@ -1,10 +1,19 @@
 *.json
 *.jsonl
 *.txt
+*.csv
+*.png
+*.dat
+*.tex
+*.html
+*.gz
+*.parquet
+*.log
 
 *.db
 *.db-shm
 *.db-wal
+*.wal
 
 .env
 
