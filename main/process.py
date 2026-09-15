@@ -15,7 +15,6 @@ from fetchcarbon import CarbonIntensityCSV as CarbonIntensityService
 from fetchcarbon import get_rounded_iso_range
 from fetchjobs import get_jobs_from_db, get_jobs_from_parquet
 from scheduling import CarbonScheduler
-from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -69,13 +68,17 @@ def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_fil
 
 def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice):
     scheduler = CarbonScheduler(cidservice)
-    total_steps = math.ceil((end_time - start_time) / 60)
-    bar = tqdm(range(total_steps), disable=None, unit="min")
-    for step in bar:
-        current = start_time + step * 60
-        scheduler.process_jobs(get_jobs(current, current + 60, jobs_file, by_submit_time))
-        bar.set_postfix(jobs=scheduler.jobs_seen)
-    return aggregate_jobs(scheduler.output_jobs())
+    current = start_time
+    while current < end_time:
+        jobs = get_jobs(current, current + 60, jobs_file, by_submit_time)
+        scheduler.process_jobs(jobs)
+        current += 60
+
+    horizon_stats = {
+        "unschedulable_jobs": len(scheduler.unschedulable),
+        "unschedulable_energy": sum(calc_energy_of_job(job) for job in scheduler.unschedulable),
+    }
+    return (*aggregate_jobs(scheduler.output_jobs()), horizon_stats)
 
 def iter_periods(startv, endv, minutes=5):
     step = timedelta(minutes=minutes)
@@ -288,8 +291,15 @@ def run_main(
         sys.exit()
     if compare_algorithm:
         logger.info("Running alternative scheduling algorithm...")
-        jobs2, min_start2, max_end2 = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice)
+        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice)
         periods2 = get_graph_data(jobs2, min_start2, max_end2, cidservice)
+        if horizon_stats["unschedulable_jobs"]:
+            energy_frac = 100 * horizon_stats["unschedulable_energy"] / sum(period["energy"] for period in periods)
+            logger.info(
+                f"{horizon_stats['unschedulable_jobs']} job(s) longer than the carbon forecast "
+                f"horizon were left at their original start ({energy_frac:.2f}% of energy)"
+            )
+        result_json |= horizon_stats
     else:
         periods2 = None
     if graph_mode != GraphMode.no_graph:

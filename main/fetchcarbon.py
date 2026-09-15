@@ -15,6 +15,8 @@ logger.setLevel(logging.DEBUG)
 
 BASE = "https://api.carbonintensity.org.uk"
 
+FORECAST_HORIZON = timedelta(hours=96)
+
 project_root = Path(__file__).resolve().parent.parent
 
 def gen_iso_string(epoch_time):
@@ -83,7 +85,7 @@ class CarbonIntensity:
         # (window_intensityint, start_datetime, end_datetime)
 
         start_datetime = min(start_datetime, datetime.now(tz=UTC))
-        end_datetime = start_datetime + timedelta(hours=96)
+        end_datetime = start_datetime + FORECAST_HORIZON
         limitstart, limitend = get_rounded_iso_range(start_datetime.timestamp(), end_datetime.timestamp())
         carbon_intensity = self.get_climate_data(limitstart, limitend, postcode, "forecast")
         carbon_prefix = build_intensity_prefix(carbon_intensity)

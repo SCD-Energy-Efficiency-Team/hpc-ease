@@ -3,45 +3,51 @@ import hashlib
 import json
 from pathlib import Path
 
-keys = ["chosen_day", "days_to_fetch", "jobs_file", "num_jobs", "exit_code", "error_type", "elapsed_sec", "max_ram_kib", "energy", "energy_2", "carbon", "carbon_2", "sys_time_sec", "user_time_sec"]
+keys = ["chosen_day", "days_to_fetch", "jobs_file", "num_jobs", "exit_code", "error_type", "elapsed_sec", "max_ram_kib", "energy", "energy_2", "carbon", "carbon_2", "sys_time_sec", "user_time_sec", "unschedulable_jobs", "unschedulable_energy"]
 
 def process(filename):
     rows = []
     with open(filename) as file:
-        for line in file:
-            line = json.loads(line)
-            error_level = line["E-Level"]
-            output = line["Output"].strip().split("\n")
+        for rawline in file:
+            run = json.loads(rawline)
+            error_level = run["E-Level"]
+            state = run["State"].rstrip("+")
+            output = run["Output"].strip().split("\n")
             cmd = output[0].split(".py ", 1)[1]
 
             result = {}
-            if error_level in [0, "0:0"] and line["State"] != "TIMEOUT":
-                for line in output[-2:]:
-                    result |= json.loads(line)
+            if state in ("TIMEOUT", "CANCELLED", "NODE_FAIL"):
+                result["error_type"] = {
+                    "TIMEOUT": "timeout",
+                    "CANCELLED": "cancelled",
+                    "NODE_FAIL": "node_fail",
+                }[state]
+            elif error_level in [0, "0:0"]:
+                for outline in output[-2:]:
+                    result |= json.loads(outline)
             else:
-                if line["State"] == "TIMEOUT":
-                    result["error_type"] = "timeout"
-                elif line["State"] == "CANCELLED":
-                    result["error_type"] = "cancelled"
+                result |= json.loads(output[-1])
+                joined_output = "\n".join(output)
+                if '❱ 59 │   │   │   assert job["req"]["node"] == 1' in joined_output and "AssertionError" in joined_output:
+                    result["error_type"] = "more_than_one_node"
+                elif "MissingCarbonData: Missing data for" in joined_output:
+                    result["error_type"] = "missing_carbon_data"
+                elif "VirtualCapacityExhausted" in joined_output or "❱ 70 │   │   │   assert len(available) == num_nodes_req" in joined_output:
+                    result["error_type"] = "virtual_capacity_exhausted"
+                elif "Parquet magic bytes not found in footer" in joined_output:
+                    result["error_type"] = "parquet_corrupted_db"
+                elif "OverflowError: date value out of range" in joined_output:
+                    # fixed at the source; kept for reprocessing pre-fix temp/ runs
+                    result["error_type"] = "timelimit_overflow"
+                elif (
+                    ("this a 'parquet' file?: Failed to open local file" in joined_output
+                     and "Detail: [errno 2] No such file or directory" in joined_output)
+                    or ("FileNotFoundError" in joined_output and "_ensure_single_source" in joined_output)
+                ):
+                    result["error_type"] = "parquet_went_missing"
                 else:
-                    result |= json.loads(output[-1])
-                    joined_output = "\n".join(output)
-                    if '❱ 59 │   │   │   assert job["req"]["node"] == 1' in joined_output and "AssertionError" in joined_output:
-                        result["error_type"] = "more_than_one_node"
-                    elif "MissingCarbonData: Missing data for" in joined_output:
-                        result["error_type"] = "missing_carbon_data"
-                    # the assert pre-dates VirtualCapacityExhausted; kept so old temp/ runs still classify
-                    elif "VirtualCapacityExhausted" in joined_output or "❱ 70 │   │   │   assert len(available) == num_nodes_req" in joined_output:
-                        result["error_type"] = "virtual_capacity_exhausted"
-                    elif "│ ❱  437 │   │   raise FileNotFoundError(path)" in joined_output and '│ ❱ 186 │   dataset = ds.dataset(filename, format="parquet")' in joined_output:
-                        result["error_type"] = "parquet_went_missing"
-                    elif "Parquet magic bytes not found in footer. Either the file is corrupted or" in joined_output:
-                        result["error_type"] = "parquet_corrupted_db"
-                    elif "this a 'parquet' file?: Failed to open local file" in joined_output and "Detail: [errno 2] No such file or directory" in joined_output:
-                        result["error_type"] = "parquet_went_missing"
-                    else:
-                        print("\n".join(output))
-                        raise Exception()
+                    print("\n".join(output))
+                    raise Exception()
 
             for param in ["--jobs-file", "--chosen-day", "--days-to-fetch"]:
                 if param in cmd:
@@ -60,6 +66,9 @@ def process(filename):
                         if splittext in line:
                             result["num_jobs"] = int(line.split(splittext)[1].strip())
             
+            if "exit_code" in result:
+                assert error_level == result["exit_code"] or error_level == f"{result['exit_code']}:0", f"{error_level!r} {result['exit_code']!r}"
+
             if "energy" in result:
                 pass
                 # assert math.isclose(result["energy"], result["energy_2"]), f"{result['energy']} {result['energy_2']}"
@@ -82,5 +91,5 @@ def process(filename):
         writer.writerows(rows)
 
 if __name__ == "__main__":
-    for filename in Path("tempold").glob("*.txt"):
+    for filename in Path("temp").glob("*.txt"):
         process(filename)
