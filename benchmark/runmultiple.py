@@ -147,7 +147,7 @@ class Slurm:
                 active_count += 1
         return active_count
 
-def make_snapshot(snapshots_root):
+def make_snapshot(snapshots_root, commit=None):
     snapshots_root.mkdir(exist_ok=True)
     start = time.time()
     while True:
@@ -157,33 +157,54 @@ def make_snapshot(snapshots_root):
         if (time.time() - start) > 10:
             raise Exception("Creating a snapshot folder took too long?")
 
-    patterns = [
-        "__pycache__", ".git", ".venv",
-        "*.pyc", "*.parquet", "*.png",
-        "carbondata.db", "uv.lock"
-    ]
+    commit_hash = None
+    if commit is None:
+        patterns = [
+            "__pycache__", ".git", ".venv",
+            "*.pyc", "*.parquet", "*.png",
+            "carbondata.db", "uv.lock"
+        ]
 
-    print("Creating snapshot folder...")
-    shutil.copytree(
-        project_root,
-        snap,
-        ignore=shutil.ignore_patterns(*patterns),
-    )
+        print("Creating snapshot folder from working tree...")
+        shutil.copytree(
+            project_root,
+            snap,
+            ignore=shutil.ignore_patterns(*patterns),
+        )
+    else:
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            cwd=project_root, check=True, capture_output=True, text=True,
+        )
+        commit_hash = resolved.stdout.strip()[:8]
 
-    try:       
+        print(f"Creating snapshot folder from commit {commit}...")
+        snap.mkdir()
+        archive = subprocess.run(
+            ["git", "archive", commit],
+            cwd=project_root, check=True, capture_output=True,
+        )
+        subprocess.run(["tar", "-x"], cwd=snap, input=archive.stdout, check=True)
+
+        # regional_carbon_intensity.csv is gitignored, so git archive skips it
+        carbon_csv = project_root / "main/regional_carbon_intensity.csv"
+        if carbon_csv.is_file():
+            shutil.copy(carbon_csv, snap / "main/regional_carbon_intensity.csv")
+
+    try:
         subprocess.run(
-            ["uv", "sync"], 
+            ["uv", "sync"],
             cwd=snap,
             check=True,
             capture_output=True,
-            text=True 
+            text=True
         )
     except subprocess.CalledProcessError as e:
         print(f"\nERROR: 'uv sync' failed with exit code {e.returncode}\n{e.stderr.strip()}\n", file=sys.stderr)
         raise Exception("uv sync failed")
 
     print(f"Snapshot folder {snap} created.")
-    return snap
+    return snap, commit_hash
 
 @app.command()
 def run_main(
@@ -201,6 +222,10 @@ def run_main(
     ] = None,
     use_slurm: bool = False,
     debug: bool = False,
+    commit: Annotated[
+        str | None,
+        typer.Option(help="Benchmark this git commit/branch/tag instead of the working tree"),
+    ] = None,
 ):
     if not use_slurm:
         jobscheduler = TaskSpooler()
@@ -226,7 +251,7 @@ def run_main(
         dates = ["2025-2-15"]
     random.shuffle(dates)
 
-    snapshot_folder = make_snapshot(Path("/home/users/jamesrav/cprojsnaps"))
+    snapshot_folder, commit_hash = make_snapshot(Path("/home/users/jamesrav/cprojsnaps"), commit=commit)
 
     # db_folder = Path(project_root) / "dbexports"
     # db_folder = Path("/work/scratch-pw5/jamesrav") / "dbexports"
@@ -266,8 +291,9 @@ def run_main(
     shutil.rmtree(snapshot_folder)
 
     print("Gathering results...")
+    suffix = f"-{commit_hash}" if commit_hash is not None else ""
     while True:
-        random_filename = f"temp/{int(time.time()*1000)!s}.txt"
+        random_filename = f"temp/{int(time.time()*1000)!s}{suffix}.txt"
         if not os.path.isfile(random_filename):
             break
     jobscheduler.get_outputs(job_ids, random_filename)

@@ -10,6 +10,8 @@
 *.parquet
 *.log
 
+!main/regional_carbon_intensity.csv
+
 *.db
 *.db-shm
 *.db-wal

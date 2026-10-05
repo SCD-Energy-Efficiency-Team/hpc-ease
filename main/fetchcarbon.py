@@ -1,3 +1,4 @@
+import bisect
 import csv
 import logging
 import math
@@ -16,6 +17,9 @@ logger.setLevel(logging.DEBUG)
 BASE = "https://api.carbonintensity.org.uk"
 
 FORECAST_HORIZON = timedelta(hours=96)
+
+YIELD_CACHE_SIZE = 4096
+CLIMATE_CACHE_SIZE = 512
 
 project_root = Path(__file__).resolve().parent.parent
 
@@ -56,53 +60,75 @@ def build_intensity_prefix(intensity_data):
 
     return prefix
 
-def calculate_cumulative_intensity(window_start, window_end, prefix):
-    total = 0.0
-    covered = timedelta(0)
-
+def build_intensity_cumsum(prefix):
+    starts = []
+    cum_intensity = [0.0]
+    cum_covered = [timedelta(0)]
     for period_start, period_end, intensity in prefix:
-        if period_end <= window_start:
-            continue
-        if period_start >= window_end:
-            break
+        starts.append(period_start)
+        span = period_end - period_start
+        cum_intensity.append(cum_intensity[-1] + intensity * span.total_seconds() / 3600)
+        cum_covered.append(cum_covered[-1] + span)
+    return starts, cum_intensity, cum_covered
 
-        overlap_start = max(window_start, period_start)
-        overlap_end = min(window_end, period_end)
+def calculate_cumulative_intensity(window_start, window_end, prefix, cumsum=None):
+    if cumsum is None:
+        cumsum = build_intensity_cumsum(prefix)
+    starts, cum_intensity, cum_covered = cumsum
 
-        overlap = overlap_end - overlap_start
-        covered += overlap
-        total += intensity * overlap.total_seconds() / 3600
+    if window_end <= window_start or not starts:
+        return 0.0, timedelta(0)
 
-    return total, covered
+    def integral_to(point):
+        i = bisect.bisect_right(starts, point) - 1
+        if i < 0:
+            return 0.0, timedelta(0)
+        period_start, period_end, intensity = prefix[i]
+        partial = max(min(point, period_end) - period_start, timedelta(0))
+        return (
+            cum_intensity[i] + intensity * partial.total_seconds() / 3600,
+            cum_covered[i] + partial,
+        )
+
+    end_intensity, end_covered = integral_to(window_end)
+    start_intensity, start_covered = integral_to(window_start)
+    return end_intensity - start_intensity, end_covered - start_covered
 
 class CarbonIntensity:
     def _get_climate_data(self, start, end, postcode="OX11", returnvalues="forecast"):
         # returns {(start_datetime, end_datetime): intensityint, ...}
         raise NotImplementedError
 
-    def _yield_lowest_periods(self, start_datetime, duration: int, postcode="OX11"):
+    def yield_lowest_periods(self, start_datetime, duration: int, postcode="OX11"):
+        start_datetime = min(start_datetime, datetime.now(tz=UTC))
+        epoch = start_datetime.timestamp()
+        return self._yield_lowest_periods_cached(
+            round_to_30min(epoch, False, iso=False), epoch % 1800 == 0, duration, postcode
+        )
+
+    def _yield_lowest_periods(self, floored_epoch, is_grid_aligned, duration: int, postcode="OX11"):
         # returns a list, with each item being:
         # (window_intensityint, start_datetime, end_datetime)
 
-        start_datetime = min(start_datetime, datetime.now(tz=UTC))
-        end_datetime = start_datetime + FORECAST_HORIZON
-        limitstart, limitend = get_rounded_iso_range(start_datetime.timestamp(), end_datetime.timestamp())
+        limitstart = gen_iso_string(floored_epoch)
+        limitend = gen_iso_string(floored_epoch + int(FORECAST_HORIZON.total_seconds()) + (0 if is_grid_aligned else 1800))
         carbon_intensity = self.get_climate_data(limitstart, limitend, postcode, "forecast")
         carbon_prefix = build_intensity_prefix(carbon_intensity)
+        carbon_cumsum = build_intensity_cumsum(carbon_prefix)
         window_start = datetime.fromisoformat(limitstart)
         window_end = window_start + timedelta(seconds=duration)
 
         # TODO: This might break in the case duration is less than the interval between window start and end?
         windows = defaultdict(list)
         while window_end < datetime.fromisoformat(limitend):
-            intensity, covered = calculate_cumulative_intensity(window_start, window_end, carbon_prefix)
+            intensity, covered = calculate_cumulative_intensity(window_start, window_end, carbon_prefix, carbon_cumsum)
             
             if covered != timedelta(seconds=duration):
                 break
 
             windows[intensity].append(window_start)
 
-            window_start += timedelta(minutes=1)
+            window_start += timedelta(minutes=30)
             window_end = window_start + timedelta(seconds=duration)
 
         results = []
@@ -114,8 +140,8 @@ class CarbonIntensity:
 class CarbonIntensitySQL(CarbonIntensity):
     def __init__(self, db):
         self.db = db
-        self.yield_lowest_periods = lru_cache(maxsize=100)(self._yield_lowest_periods)
-        self.get_climate_data = lru_cache(maxsize=100)(self._get_climate_data)
+        self._yield_lowest_periods_cached = lru_cache(maxsize=YIELD_CACHE_SIZE)(self._yield_lowest_periods)
+        self.get_climate_data = lru_cache(maxsize=CLIMATE_CACHE_SIZE)(self._get_climate_data)
 
     def fetch_climate_data_pure(self, start, end, postcode="OX11"):
         logger.info(f"Downloading carbon intensity data between {start} and {end}...")
@@ -228,8 +254,8 @@ class CarbonIntensityMariaDB(CarbonIntensitySQL):
 
 class CarbonIntensityCSV(CarbonIntensity):
     def __init__(self):
-        self.yield_lowest_periods = lru_cache(maxsize=100)(self._yield_lowest_periods)
-        self.get_climate_data = lru_cache(maxsize=100)(self._get_climate_data)
+        self._yield_lowest_periods_cached = lru_cache(maxsize=YIELD_CACHE_SIZE)(self._yield_lowest_periods)
+        self.get_climate_data = lru_cache(maxsize=CLIMATE_CACHE_SIZE)(self._get_climate_data)
 
         self.csv_data = None
         self.cache_csv_data()

@@ -4,6 +4,9 @@ except ImportError as e:
     pass
     # print(f"WARNING: Failed to import MariaDB, may cause crash if required... ({e})")
 
+import math
+from collections import defaultdict
+
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from dotenv import dotenv_values
@@ -116,3 +119,40 @@ def get_jobs_from_parquet(start_window, end_window, filename, by_submit_time=Tru
     scanner = dataset.scanner(filter=time_filter)
     for record_batch in scanner.to_batches():
         yield from record_batch.to_pylist()
+
+###
+
+BATCH_SECONDS = 60
+CHUNK_SECONDS = 86400
+
+
+def _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows):
+    start_window, end_window = int(start_window), int(end_window)
+    for chunk_start in range(start_window, end_window, CHUNK_SECONDS):
+        chunk_end = min(chunk_start + CHUNK_SECONDS, end_window)
+        buckets = defaultdict(list)
+        for row in fetch_chunk_rows(chunk_start, chunk_end):
+            buckets[(row["time"]["submit"] - chunk_start) // batch_seconds].append(row)
+        num_batches = math.ceil((chunk_end - chunk_start) / batch_seconds)
+        for index in range(num_batches):
+            yield buckets.pop(index, [])
+
+
+def get_job_batches_from_parquet(start_window, end_window, filename, by_submit_time=True, batch_seconds=BATCH_SECONDS):
+    assert by_submit_time, "Shouldn't be using start and end time"
+    dataset = ds.dataset(filename, format="parquet")
+
+    def fetch_chunk_rows(chunk_start, chunk_end):
+        time_filter = (pc.field(("time", "submit")) >= chunk_start) & (pc.field(("time", "submit")) < chunk_end)
+        return dataset.scanner(filter=time_filter).to_table().to_pylist()
+
+    yield from _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows)
+
+
+def get_job_batches_from_db(start_window, end_window, jobs_file=None, by_submit_time=True, batch_seconds=BATCH_SECONDS):
+    assert by_submit_time, "Shouldn't be using start and end time"
+
+    def fetch_chunk_rows(chunk_start, chunk_end):
+        return get_jobs_from_db(chunk_start, chunk_end, jobs_file, by_submit_time)
+
+    yield from _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows)

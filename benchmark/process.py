@@ -3,8 +3,6 @@ import hashlib
 import json
 from pathlib import Path
 
-keys = ["chosen_day", "days_to_fetch", "jobs_file", "num_jobs", "exit_code", "error_type", "elapsed_sec", "max_ram_kib", "energy", "energy_2", "carbon", "carbon_2", "sys_time_sec", "user_time_sec", "unschedulable_jobs", "unschedulable_energy"]
-
 def process(filename):
     rows = []
     with open(filename) as file:
@@ -13,15 +11,17 @@ def process(filename):
             error_level = run["E-Level"]
             state = run["State"].rstrip("+")
             output = run["Output"].strip().split("\n")
-            cmd = output[0].split(".py ", 1)[1]
 
             result = {}
-            if state in ("TIMEOUT", "CANCELLED", "NODE_FAIL"):
+            if state in ("TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_ME"):
                 result["error_type"] = {
                     "TIMEOUT": "timeout",
                     "CANCELLED": "cancelled",
                     "NODE_FAIL": "node_fail",
+                    "OUT_OF_ME": "out_of_memory",  # sacct truncates OUT_OF_MEMORY
                 }[state]
+            elif output[0].endswith("/usr/bin/time: No such file or directory"):
+                result["error_type"] = "time_binary_missing"
             elif error_level in [0, "0:0"]:
                 for outline in output[-2:]:
                     result |= json.loads(outline)
@@ -49,6 +49,8 @@ def process(filename):
                     print("\n".join(output))
                     raise Exception()
 
+            cmd = output[0].split(".py ", 1)[1] if ".py " in output[0] else ""
+
             for param in ["--jobs-file", "--chosen-day", "--days-to-fetch"]:
                 if param in cmd:
                     value = cmd.split(param+" ", 1)[1].split(" ")[0].strip()
@@ -71,17 +73,20 @@ def process(filename):
 
             if "energy" in result:
                 pass
-                # assert math.isclose(result["energy"], result["energy_2"]), f"{result['energy']} {result['energy_2']}"
+                # assert math.isclose(result["energy"], result["energy_2"], abs_tol=1.0), f"{result['energy']} {result['energy_2']} {filename}"
 
             rows.append(result)
 
+    keys = []
     for row in rows:
         for key in row:
-            assert key in keys, key
+            if key not in keys:
+                keys.append(key)
 
-    if all(row["chosen_day"].endswith("T00:00:00+00:00") for row in rows):
+    if all(row.get("chosen_day", "").endswith("T00:00:00+00:00") for row in rows if "chosen_day" in row):
         for row in rows:
-            row["chosen_day"] = row["chosen_day"].rsplit("T", 1)[0]
+            if "chosen_day" in row:
+                row["chosen_day"] = row["chosen_day"].rsplit("T", 1)[0]
 
     serialized_data = json.dumps({"keys": keys, "rows": rows}, sort_keys=True)
     hashofdata = hashlib.sha256(serialized_data.encode("utf-8")).hexdigest()

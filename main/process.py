@@ -13,7 +13,12 @@ from pathlib import Path
 import typer
 from fetchcarbon import CarbonIntensityCSV as CarbonIntensityService
 from fetchcarbon import get_rounded_iso_range
-from fetchjobs import get_jobs_from_db, get_jobs_from_parquet
+from fetchjobs import (
+    get_job_batches_from_db,
+    get_job_batches_from_parquet,
+    get_jobs_from_db,
+    get_jobs_from_parquet,
+)
 from scheduling import CarbonScheduler
 
 logging.basicConfig(
@@ -66,13 +71,10 @@ def aggregate_jobs(jobs_iter):
 def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file):
     return aggregate_jobs(get_jobs(start_time, end_time, jobs_file, by_submit_time))
 
-def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice):
+def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice):
     scheduler = CarbonScheduler(cidservice)
-    current = start_time
-    while current < end_time:
-        jobs = get_jobs(current, current + 60, jobs_file, by_submit_time)
-        scheduler.process_jobs(jobs)
-        current += 60
+    for batch in get_job_batches(start_time, end_time, jobs_file, by_submit_time):
+        scheduler.process_jobs(batch)
 
     horizon_stats = {
         "unschedulable_jobs": len(scheduler.unschedulable),
@@ -254,9 +256,9 @@ def run_main(
     print(" ".join(sys.argv))
 
     if jobs_file:
-        get_jobs = get_jobs_from_parquet
+        get_jobs, get_job_batches = get_jobs_from_parquet, get_job_batches_from_parquet
     else:
-        get_jobs = get_jobs_from_db
+        get_jobs, get_job_batches = get_jobs_from_db, get_job_batches_from_db
 
     while True:
         if choose_random:
@@ -291,7 +293,7 @@ def run_main(
         sys.exit()
     if compare_algorithm:
         logger.info("Running alternative scheduling algorithm...")
-        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_jobs, jobs_file, cidservice)
+        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice)
         periods2 = get_graph_data(jobs2, min_start2, max_end2, cidservice)
         if horizon_stats["unschedulable_jobs"]:
             energy_frac = 100 * horizon_stats["unschedulable_energy"] / sum(period["energy"] for period in periods)

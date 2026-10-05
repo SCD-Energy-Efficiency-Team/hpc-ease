@@ -10,6 +10,14 @@ class VirtualCapacityExhausted(Exception):
     """No window in the carbon forecast has enough free nodes to host the job."""
 
 
+def _effective_end(job, time_start, time_end):
+    reservation_s = (time_end - time_start).total_seconds()
+    elapsed = job["time"]["elapsed"]
+    if elapsed < reservation_s:
+        return time_start + timedelta(seconds=elapsed)
+    return time_end
+
+
 class Node:
     def __init__(self):
         # TODO: Could set these arbitrarily ridiculously high, to show imaginary lowest possible
@@ -21,31 +29,57 @@ class Node:
         self.cap_cores = self.NUM_CPUS * self.NUM_CORES_PER_CPU
         self.cap_mem = self.MEM_GIB * 1024
 
-    def can_assign(self, job, time_start, time_end=None, now=None):
+        self._bucket_totals = {}
+
+    def can_assign(self, job, time_start, time_end=None):
         if time_end is None:
             time_end = time_start + timedelta(minutes=job["timelimit"])
 
-        assigned_cores, assigned_mem = 0, 0
-        for (ajob_start, ajob_end), ajobs in self.jobs.items():
-            for ajob in ajobs:
-                actual_end = ajob_start + timedelta(seconds=ajob["time"]["elapsed"])
-                if now is not None and now >= actual_end:
-                    effective_end = min(actual_end, ajob_end)
-                else:
-                    effective_end = ajob_end
+        # req.cpu/req.mem are totals across all req.node nodes -- divide to get one node's share.
+        req_cpu, req_mem = job["req"]["cpu"] // job["req"]["node"], job["req"]["mem"] // job["req"]["node"]
 
-                if time_start < effective_end and ajob_start < time_end:
-                    assigned_cores += ajob["req"]["cpu"]
-                    assigned_mem += ajob["req"]["mem"]
-                    if (assigned_cores + job["req"]["cpu"] > self.cap_cores) or (assigned_mem + job["req"]["mem"] > self.cap_mem):
-                        return False
-        return True
-    
+        summed_cores, summed_mem = 0, 0
+        for (ajob_start, ajob_end), (cpu_total, mem_total) in self._bucket_totals.items():
+            if time_start < ajob_end and ajob_start < time_end:
+                summed_cores += cpu_total
+                summed_mem += mem_total
+        if summed_cores + req_cpu <= self.cap_cores and summed_mem + req_mem <= self.cap_mem:
+            return True
+
+        events = []
+        for (ajob_start, ajob_end), ajobs in self.jobs.items():
+            if not (time_start < ajob_end and ajob_start < time_end):
+                continue
+            for ajob, effective_end in ajobs:
+                if effective_end <= time_start:
+                    continue
+                ocpu = ajob["req"]["cpu"] // ajob["req"]["node"]
+                omem = ajob["req"]["mem"] // ajob["req"]["node"]
+                events.append((max(ajob_start, time_start), 1, ocpu, omem))
+                events.append((min(effective_end, time_end), 0, -ocpu, -omem))
+        events.sort()  # releases (tag 0) before acquires (tag 1) at an equal timestamp
+
+        peak_cores, peak_mem = 0, 0
+        cur_cores, cur_mem = 0, 0
+        for _, _tag, dcpu, dmem in events:
+            cur_cores += dcpu
+            cur_mem += dmem
+            peak_cores = max(peak_cores, cur_cores)
+            peak_mem = max(peak_mem, cur_mem)
+
+        return peak_cores + req_cpu <= self.cap_cores and peak_mem + req_mem <= self.cap_mem
+
     def assign(self, job, time_start, time_end=None, skip_check=False):
         if time_end is None:
             time_end = time_start + timedelta(minutes=job["timelimit"])
         if skip_check or self.can_assign(job, time_start, time_end):
-            self.jobs[(time_start, time_end)].append(job)
+            effective_end = _effective_end(job, time_start, time_end)
+            self.jobs[(time_start, time_end)].append((job, effective_end))
+
+            req_cpu, req_mem = job["req"]["cpu"] // job["req"]["node"], job["req"]["mem"] // job["req"]["node"]
+            key = (time_start, effective_end)
+            cpu_total, mem_total = self._bucket_totals.get(key, (0, 0))
+            self._bucket_totals[key] = (cpu_total + req_cpu, mem_total + req_mem)
             return True
         return False
 
@@ -76,10 +110,23 @@ class CarbonScheduler:
         for node in self.nodes[: job["req"]["node"]]:
             node.assign(job, pinned_start, pinned_end, skip_check=True)
 
+    def _is_permanently_infeasible(self, job):
+        # can never fit any window
+        num_nodes = job["req"]["node"]
+        if num_nodes > self.NUM_NODES:
+            return True
+        per_node_cpu = job["req"]["cpu"] // num_nodes
+        per_node_mem = job["req"]["mem"] // num_nodes
+        return per_node_cpu > self.nodes[0].cap_cores or per_node_mem > self.nodes[0].cap_mem
+
     def process_jobs(self, jobs):
         jobs = sorted(jobs, key=cmp_to_key(job_comparator))
         for job in tqdm(jobs, leave=False, disable=None):
             num_nodes_req = job["req"]["node"]
+
+            if self._is_permanently_infeasible(job):
+                self._pin_unschedulable(job)
+                continue
 
             # avoids overflow in yield_lowest_periods for unbounded/huge timelimits
             if timedelta(minutes=job["timelimit"]) > FORECAST_HORIZON:
@@ -97,7 +144,7 @@ class CarbonScheduler:
             for _, window_start, window_end in windows:
                 chosen = []
                 for node in self.nodes:
-                    if node.can_assign(job, window_start, window_end, now=submit_time):
+                    if node.can_assign(job, window_start, window_end):
                         chosen.append(node)
                         if len(chosen) == num_nodes_req:
                             break
@@ -118,7 +165,7 @@ class CarbonScheduler:
         seen = set()
         for node in self.nodes:
             for (time_start, time_end), jobs in node.jobs.items():
-                for job in jobs:
+                for job, _ in jobs:
                     if id(job) in seen:
                         continue
                     seen.add(id(job))
