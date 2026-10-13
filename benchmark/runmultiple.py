@@ -19,6 +19,9 @@ project_root = Path(__file__).resolve().parent.parent
 
 app = typer.Typer()
 
+# host1262 has no /usr/bin/time, so every job landed there dies with exit 127
+DEFAULT_EXCLUDE_NODES = ["host1262"]
+
 def get_days():
     start_range, end_range = 1725608400, 1780351201
     start_range, end_range = datetime.fromtimestamp(start_range, tz=UTC), datetime.fromtimestamp(end_range, tz=UTC)
@@ -90,8 +93,8 @@ class TaskSpooler:
         return active_count
 
 class Slurm:
-    def __init__(self):
-        pass
+    def __init__(self, exclude_nodes=()):
+        self.exclude_nodes = list(exclude_nodes)
 
     def submit(self, day_string, days_to_fetch, project_folder, jobs_file=None):
         assert jobs_file is not None, "get_from_db should not work on Slurm"
@@ -105,6 +108,8 @@ class Slurm:
             "-N", "1", "-c", "1",
             "-o", "slurmoutputs/job_%j.log"
         ]
+        if self.exclude_nodes:
+            slurm_part.append(f"--exclude={','.join(self.exclude_nodes)}")
         time_part = ["/usr/bin/time", "-f", '{"exit_code":%x,"max_ram_kib":%M,"user_time_sec":%U,"sys_time_sec":%S,"elapsed_sec":%e}']
         python_part = [
             str(project_folder / ".venv/bin/python3"),
@@ -226,12 +231,24 @@ def run_main(
         str | None,
         typer.Option(help="Benchmark this git commit/branch/tag instead of the working tree"),
     ] = None,
+    exclude_nodes: Annotated[
+        list[str] | None,
+        typer.Option(help=f"Slurm nodes to exclude (default: {', '.join(DEFAULT_EXCLUDE_NODES)})"),
+    ] = None,
+    no_exclude: Annotated[
+        bool,
+        typer.Option("--no-exclude", help="Don't exclude any Slurm nodes, overriding --exclude-nodes and the default"),
+    ] = False,
 ):
+    if no_exclude:
+        exclude_nodes = []
+    elif exclude_nodes is None:
+        exclude_nodes = DEFAULT_EXCLUDE_NODES
     if not use_slurm:
         jobscheduler = TaskSpooler()
     else:
         assert jobs_file is not None, "get_from_db should not work on Slurm"
-        jobscheduler = Slurm()
+        jobscheduler = Slurm(exclude_nodes)
 
     combos = []
 

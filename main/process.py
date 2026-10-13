@@ -71,14 +71,16 @@ def aggregate_jobs(jobs_iter):
 def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file):
     return aggregate_jobs(get_jobs(start_time, end_time, jobs_file, by_submit_time))
 
-def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice):
-    scheduler = CarbonScheduler(cidservice)
+def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, strict=False):
+    scheduler = CarbonScheduler(cidservice, strict=strict)
     for batch in get_job_batches(start_time, end_time, jobs_file, by_submit_time):
         scheduler.process_jobs(batch)
 
     horizon_stats = {
         "unschedulable_jobs": len(scheduler.unschedulable),
         "unschedulable_energy": sum(calc_energy_of_job(job) for job in scheduler.unschedulable),
+        "crowded_out_jobs": len(scheduler.crowded_out),
+        "crowded_out_energy": sum(calc_energy_of_job(job) for job in scheduler.crowded_out),
     }
     return (*aggregate_jobs(scheduler.output_jobs()), horizon_stats)
 
@@ -243,7 +245,8 @@ def run_main(
     graph_mode: GraphMode = GraphMode.save_graph,
     print_json: bool = False,
     do_ask: bool = True,
-    jobs_file: str | None = None
+    jobs_file: str | None = None,
+    strict: bool = False  # raise VirtualCapacityExhausted instead of pinning crowded-out jobs
 ):
     # 2025-11-9 (16373), 2026-5-4 (89424), 2025-1-9 (7850), 2025-2-15 (2344)
     choose_random = chosen_day is None
@@ -293,13 +296,20 @@ def run_main(
         sys.exit()
     if compare_algorithm:
         logger.info("Running alternative scheduling algorithm...")
-        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice)
+        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, strict=strict)
         periods2 = get_graph_data(jobs2, min_start2, max_end2, cidservice)
+        total_energy = sum(period["energy"] for period in periods)
         if horizon_stats["unschedulable_jobs"]:
-            energy_frac = 100 * horizon_stats["unschedulable_energy"] / sum(period["energy"] for period in periods)
+            energy_frac = 100 * horizon_stats["unschedulable_energy"] / total_energy
             logger.info(
-                f"{horizon_stats['unschedulable_jobs']} job(s) longer than the carbon forecast "
-                f"horizon were left at their original start ({energy_frac:.2f}% of energy)"
+                f"{horizon_stats['unschedulable_jobs']} job(s) beyond the carbon forecast horizon "
+                f"(or otherwise unplaceable) were left at their original start ({energy_frac:.2f}% of energy)"
+            )
+        if horizon_stats["crowded_out_jobs"]:
+            energy_frac = 100 * horizon_stats["crowded_out_energy"] / total_energy
+            logger.info(
+                f"{horizon_stats['crowded_out_jobs']} job(s) found no window with free capacity and were "
+                f"left at their original start ({energy_frac:.2f}% of energy)"
             )
         result_json |= horizon_stats
     else:

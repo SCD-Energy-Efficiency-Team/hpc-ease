@@ -5,9 +5,11 @@ from functools import cmp_to_key
 from fetchcarbon import FORECAST_HORIZON
 from tqdm import tqdm
 
+PIN_IF_FEWER_WINDOWS_THAN = 2
+
 
 class VirtualCapacityExhausted(Exception):
-    """No window in the carbon forecast has enough free nodes to host the job."""
+    """No window has enough free nodes. Only raised under strict=True."""
 
 
 def _effective_end(job, time_start, time_end):
@@ -30,21 +32,26 @@ class Node:
         self.cap_mem = self.MEM_GIB * 1024
 
         self._bucket_totals = {}
+        self._peak_cache = {}
+        self._bucket_sum_cache = {}
+        self._peak_floor = {}  # per-window lower bound on peak usage; never cleared, reject-only
 
-    def can_assign(self, job, time_start, time_end=None):
-        if time_end is None:
-            time_end = time_start + timedelta(minutes=job["timelimit"])
-
-        # req.cpu/req.mem are totals across all req.node nodes -- divide to get one node's share.
-        req_cpu, req_mem = job["req"]["cpu"] // job["req"]["node"], job["req"]["mem"] // job["req"]["node"]
-
+    def _bucket_sum(self, time_start, time_end):
+        cached = self._bucket_sum_cache.get((time_start, time_end))
+        if cached is not None:
+            return cached
         summed_cores, summed_mem = 0, 0
         for (ajob_start, ajob_end), (cpu_total, mem_total) in self._bucket_totals.items():
             if time_start < ajob_end and ajob_start < time_end:
                 summed_cores += cpu_total
                 summed_mem += mem_total
-        if summed_cores + req_cpu <= self.cap_cores and summed_mem + req_mem <= self.cap_mem:
-            return True
+        self._bucket_sum_cache[(time_start, time_end)] = (summed_cores, summed_mem)
+        return summed_cores, summed_mem
+
+    def _peak_usage(self, time_start, time_end):
+        cached = self._peak_cache.get((time_start, time_end))
+        if cached is not None:
+            return cached
 
         events = []
         for (ajob_start, ajob_end), ajobs in self.jobs.items():
@@ -67,6 +74,33 @@ class Node:
             peak_cores = max(peak_cores, cur_cores)
             peak_mem = max(peak_mem, cur_mem)
 
+        self._peak_cache[(time_start, time_end)] = (peak_cores, peak_mem)
+
+        key = (time_start, time_end)
+        prev_floor = self._peak_floor.get(key)
+        self._peak_floor[key] = (
+            (peak_cores, peak_mem) if prev_floor is None
+            else (max(prev_floor[0], peak_cores), max(prev_floor[1], peak_mem))
+        )
+
+        return peak_cores, peak_mem
+
+    def can_assign(self, job, time_start, time_end=None):
+        if time_end is None:
+            time_end = time_start + timedelta(minutes=job["timelimit"])
+
+        # req.cpu/req.mem are totals across all req.node nodes -- divide to get one node's share.
+        req_cpu, req_mem = job["req"]["cpu"] // job["req"]["node"], job["req"]["mem"] // job["req"]["node"]
+
+        floor = self._peak_floor.get((time_start, time_end))
+        if floor is not None and (floor[0] + req_cpu > self.cap_cores or floor[1] + req_mem > self.cap_mem):
+            return False
+
+        summed_cores, summed_mem = self._bucket_sum(time_start, time_end)
+        if summed_cores + req_cpu <= self.cap_cores and summed_mem + req_mem <= self.cap_mem:
+            return True
+
+        peak_cores, peak_mem = self._peak_usage(time_start, time_end)
         return peak_cores + req_cpu <= self.cap_cores and peak_mem + req_mem <= self.cap_mem
 
     def assign(self, job, time_start, time_end=None, skip_check=False):
@@ -80,6 +114,8 @@ class Node:
             key = (time_start, effective_end)
             cpu_total, mem_total = self._bucket_totals.get(key, (0, 0))
             self._bucket_totals[key] = (cpu_total + req_cpu, mem_total + req_mem)
+            self._peak_cache.clear()
+            self._bucket_sum_cache.clear()
             return True
         return False
 
@@ -93,15 +129,19 @@ def job_comparator(a, b):
     return job_footprint(b) - job_footprint(a)
 
 class CarbonScheduler:
-    def __init__(self, cidservice):
+    def __init__(self, cidservice, strict=False):
         self.NUM_NODES = 255
         self.nodes = [Node() for node in range(self.NUM_NODES)]
         self.cidservice = cidservice
+        self.strict = strict  # raise VirtualCapacityExhausted instead of pinning crowded-out jobs
 
         self.unschedulable = []
+        self.crowded_out = []
+        self.placements = []  # (job, start_dt)
+        self._node_cursor = {}  # (window_start, window_end, shape) -> first node not yet proven full
 
-    def _pin_unschedulable(self, job):
-        self.unschedulable.append(job)
+    def _pin_unschedulable(self, job, crowded_out=False):
+        (self.crowded_out if crowded_out else self.unschedulable).append(job)
         anchor = job["time"]["start"] or job["time"]["submit"]
         pinned_start = datetime.fromtimestamp(anchor, tz=UTC)
         # clamp so Slurm's INFINITE timelimit can't overflow datetime.max
@@ -109,6 +149,7 @@ class CarbonScheduler:
         pinned_end = pinned_start + duration
         for node in self.nodes[: job["req"]["node"]]:
             node.assign(job, pinned_start, pinned_end, skip_check=True)
+        self.placements.append((job, pinned_start))
 
     def _is_permanently_infeasible(self, job):
         # can never fit any window
@@ -140,35 +181,49 @@ class CarbonScheduler:
                 self._pin_unschedulable(job)
                 continue
 
+            shape = (job["req"]["cpu"] // num_nodes_req, job["req"]["mem"] // num_nodes_req)
             best = None
             for _, window_start, window_end in windows:
+                cursor_key = (window_start, window_end, shape)
+                start_index = self._node_cursor.get(cursor_key, 0)
+                if start_index >= self.NUM_NODES:
+                    continue  # every node already proven full for this shape+window
+
                 chosen = []
-                for node in self.nodes:
-                    if node.can_assign(job, window_start, window_end):
-                        chosen.append(node)
+                advancing = True  # still extending the known-full prefix
+                for index in range(start_index, self.NUM_NODES):
+                    if self.nodes[index].can_assign(job, window_start, window_end):
+                        chosen.append(self.nodes[index])
+                        if advancing:
+                            self._node_cursor[cursor_key] = index  # this node isn't full; stop here
+                            advancing = False
                         if len(chosen) == num_nodes_req:
                             break
+                    elif advancing:
+                        self._node_cursor[cursor_key] = index + 1
+
                 if len(chosen) == num_nodes_req:
                     best = (chosen, window_start, window_end)
                     break
 
             if best is None:
-                raise VirtualCapacityExhausted(
-                    f"No window with {num_nodes_req} available nodes for job {job['id_job']}"
-                )
+                if len(windows) < PIN_IF_FEWER_WINDOWS_THAN:
+                    self._pin_unschedulable(job)
+                    continue
+                if self.strict:
+                    raise VirtualCapacityExhausted(
+                        f"No window with {num_nodes_req} available nodes for job {job['id_job']}"
+                    )
+                self._pin_unschedulable(job, crowded_out=True)
+                continue
 
             chosen, window_start, window_end = best
             for node in chosen:
                 node.assign(job, window_start, window_end, skip_check=True)
+            self.placements.append((job, window_start))
 
     def output_jobs(self):
-        seen = set()
-        for node in self.nodes:
-            for (time_start, time_end), jobs in node.jobs.items():
-                for job, _ in jobs:
-                    if id(job) in seen:
-                        continue
-                    seen.add(id(job))
-                    job["time"]["start"] = int(time_start.timestamp())
-                    job["time"]["end"] = job["time"]["start"] + job["time"]["elapsed"]
-                    yield job
+        for job, start_dt in self.placements:
+            job["time"]["start"] = int(start_dt.timestamp())
+            job["time"]["end"] = job["time"]["start"] + job["time"]["elapsed"]
+            yield job
