@@ -18,6 +18,9 @@ BASE = "https://api.carbonintensity.org.uk"
 
 FORECAST_HORIZON = timedelta(hours=96)
 
+DEFAULT_HEAD_FRACTION = 0.25
+DEFAULT_HEAD_WEIGHT = 4.0  # 1.0 = flat score (unchanged behaviour)
+
 YIELD_CACHE_SIZE = 4096
 CLIMATE_CACHE_SIZE = 512
 
@@ -94,10 +97,40 @@ def calculate_cumulative_intensity(window_start, window_end, prefix, cumsum=None
     start_intensity, start_covered = integral_to(window_start)
     return end_intensity - start_intensity, end_covered - start_covered
 
+def calculate_weighted_intensity(window_start, window_end, prefix, cumsum, head_fraction, head_weight):
+    # first head_fraction of the window (split snapped to the 30-min grid) counts head_weight times the rest
+    intensity, covered = calculate_cumulative_intensity(window_start, window_end, prefix, cumsum)
+    if head_weight == 1.0:
+        return intensity, covered
+    duration = (window_end - window_start).total_seconds()
+    head_s = min(duration, round(head_fraction * duration / 1800) * 1800)
+    if head_s <= 0:
+        return intensity, covered
+    split = window_start + timedelta(seconds=head_s)
+    head, _ = calculate_cumulative_intensity(window_start, split, prefix, cumsum)
+    return head * head_weight + (intensity - head), covered
+
 class CarbonIntensity:
+    head_fraction = DEFAULT_HEAD_FRACTION
+    head_weight = DEFAULT_HEAD_WEIGHT
+    max_wait = None  # timedelta: latest window start after the floored submit time; None = whole horizon
+
     def _get_climate_data(self, start, end, postcode="OX11", returnvalues="forecast"):
         # returns {(start_datetime, end_datetime): intensityint, ...}
         raise NotImplementedError
+
+    def score_window(self, start_datetime, duration: int, postcode="OX11"):
+        # same weighted score yield_lowest_periods ranks by, for an arbitrary (not grid-aligned) window;
+        # calls the uncached _get_climate_data so one-off keys don't evict the horizon queries
+        start_epoch = start_datetime.timestamp()
+        end_epoch = start_epoch + duration
+        limitstart, limitend = get_rounded_iso_range(int(start_epoch), int(end_epoch))
+        prefix = build_intensity_prefix(self._get_climate_data(limitstart, limitend, postcode, "forecast"))
+        score, _ = calculate_weighted_intensity(
+            start_datetime, start_datetime + timedelta(seconds=duration),
+            prefix, build_intensity_cumsum(prefix), self.head_fraction, self.head_weight,
+        )
+        return score
 
     def yield_lowest_periods(self, start_datetime, duration: int, postcode="OX11"):
         start_datetime = min(start_datetime, datetime.now(tz=UTC))
@@ -117,12 +150,15 @@ class CarbonIntensity:
         carbon_cumsum = build_intensity_cumsum(carbon_prefix)
         window_start = datetime.fromisoformat(limitstart)
         window_end = window_start + timedelta(seconds=duration)
+        last_start = None if self.max_wait is None else window_start + self.max_wait
 
         # TODO: This might break in the case duration is less than the interval between window start and end?
         windows = defaultdict(list)
-        while window_end < datetime.fromisoformat(limitend):
-            intensity, covered = calculate_cumulative_intensity(window_start, window_end, carbon_prefix, carbon_cumsum)
-            
+        while window_end < datetime.fromisoformat(limitend) and (last_start is None or window_start <= last_start):
+            intensity, covered = calculate_weighted_intensity(
+                window_start, window_end, carbon_prefix, carbon_cumsum, self.head_fraction, self.head_weight
+            )
+
             if covered != timedelta(seconds=duration):
                 break
 
@@ -253,7 +289,11 @@ class CarbonIntensityMariaDB(CarbonIntensitySQL):
         super().__init__(db)
 
 class CarbonIntensityCSV(CarbonIntensity):
-    def __init__(self):
+    def __init__(self, head_fraction=DEFAULT_HEAD_FRACTION, head_weight=DEFAULT_HEAD_WEIGHT, max_wait_hours=None):
+        # fixed at construction: the lru_cache below would otherwise serve stale windows
+        self.head_fraction = head_fraction
+        self.head_weight = head_weight
+        self.max_wait = None if max_wait_hours is None else timedelta(hours=max_wait_hours)
         self._yield_lowest_periods_cached = lru_cache(maxsize=YIELD_CACHE_SIZE)(self._yield_lowest_periods)
         self.get_climate_data = lru_cache(maxsize=CLIMATE_CACHE_SIZE)(self._get_climate_data)
 

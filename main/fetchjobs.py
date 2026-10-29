@@ -135,7 +135,7 @@ def _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows)
             buckets[(row["time"]["submit"] - chunk_start) // batch_seconds].append(row)
         num_batches = math.ceil((chunk_end - chunk_start) / batch_seconds)
         for index in range(num_batches):
-            yield buckets.pop(index, [])
+            yield chunk_start + index * batch_seconds, buckets.pop(index, [])
 
 
 def get_job_batches_from_parquet(start_window, end_window, filename, by_submit_time=True, batch_seconds=BATCH_SECONDS):

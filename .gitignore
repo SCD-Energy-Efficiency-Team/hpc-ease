@@ -18,6 +18,8 @@
 *.wal
 
 .env
+benchmark/clusters.toml
+graphs/
 
 ###
 

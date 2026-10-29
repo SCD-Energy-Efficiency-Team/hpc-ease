@@ -1,0 +1,29 @@
+# Slurm routes for runmultiple.py --use-slurm. Copy to clusters.toml (git-ignored) and edit.
+# Pick one with --route NAME, or set `default` here. Task-spooler runs ignore this file.
+default = "example"
+
+# Routes can share an account and partition and differ only in qos or reservation: e.g. one route that
+# uses a reservation and another that doesn't but asks for a higher-priority qos. Add one [routes.NAME]
+# block per way you submit and choose with --route.
+
+[routes.example]
+account = "my-account"        # sbatch -A
+partition = "standard"        # sbatch -p
+qos = "normal"                # used by any resources row that has no qos of its own
+# reservation = "my-reservation"   # optional: sbatch --reservation
+# exclude = ["badnode01"]          # optional: nodes to avoid (replaced by --exclude-nodes, cleared by --no-exclude)
+# max_time = "24:00:00"            # optional: the cluster's wall-time cap; a row over it is rejected at load
+# ends = "2026-12-31T23:59:59"     # optional: warn if a job's time limit would run past this (reservation end)
+# extra_args = ["--constraint=x"]  # optional: raw sbatch arguments appended as given
+
+# Rows are tried in order; the first whose max_days >= streamed days (span + warm-up + cool-down) wins.
+# A row with no max_days matches anything, so end with one unless you want longer spans refused.
+resources = [
+  { max_days = 2,  mem = "4G",  time = "02:00:00" },
+  { max_days = 7,  mem = "6G",  time = "04:00:00" },
+  { max_days = 20, mem = "8G",  time = "12:00:00" },
+  { max_days = 30, mem = "8G",  time = "24:00:00" },
+  { max_days = 45, mem = "12G", time = "24:00:00" },
+  { max_days = 60, mem = "12G", time = "36:00:00" },
+  {                mem = "16G", time = "72:00:00" },
+]

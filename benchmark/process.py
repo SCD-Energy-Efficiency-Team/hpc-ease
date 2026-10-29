@@ -13,7 +13,10 @@ def process(filename):
             output = run["Output"].strip().split("\n")
 
             result = {}
-            if state in ("TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_ME"):
+            if state in ("RUNNING", "PENDING", "REQUEUED"):
+                # log was gathered before the job finished: no result line to parse
+                result["error_type"] = "still_running"
+            elif state in ("TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_ME"):
                 result["error_type"] = {
                     "TIMEOUT": "timeout",
                     "CANCELLED": "cancelled",
@@ -68,6 +71,38 @@ def process(filename):
                         if splittext in line:
                             result["num_jobs"] = int(line.split(splittext)[1].strip())
             
+            # logs from before retirement was always on carry --retire/--no-retire; newer ones carry neither
+            if "--no-retire" in cmd:
+                result["retire"] = False
+            elif "--retire" in cmd:
+                result["retire"] = True
+            # --max-wait was called --max-delay in older logs
+            for max_wait_flag in ("--max-wait ", "--max-delay "):
+                if max_wait_flag in cmd:
+                    result["max_wait"] = float(cmd.split(max_wait_flag, 1)[1].split(" ")[0])
+                    break
+            if "--reschedule-percent " in cmd:
+                result["reschedule_percent"] = float(cmd.split("--reschedule-percent ", 1)[1].split(" ")[0])
+            if "--reschedule-seed " in cmd:
+                result["reschedule_seed"] = int(cmd.split("--reschedule-seed ", 1)[1].split(" ")[0])
+            if "--warmup-days " in cmd:
+                result["warmup_days"] = float(cmd.split("--warmup-days ", 1)[1].split(" ")[0])
+            if "--cooldown-days " in cmd:
+                result["cooldown_days"] = float(cmd.split("--cooldown-days ", 1)[1].split(" ")[0])
+            # logs from before defer became the default carry --defer or neither flag (defer off); newer ones carry one explicitly
+            if "--no-defer" in cmd:
+                result["defer"] = False
+            elif "--defer" in cmd:
+                result["defer"] = True
+            if "--retry-timeout " in cmd:
+                result["retry_timeout"] = float(cmd.split("--retry-timeout ", 1)[1].split(" ")[0])
+            # blank means process.py's default (4.0), since the harness omits the flag when --head-weight is not given
+            if "--head-weight " in cmd:
+                result["head_weight"] = float(cmd.split("--head-weight ", 1)[1].split(" ")[0])
+            # blank means process.py's default (0.25)
+            if "--head-fraction " in cmd:
+                result["head_fraction"] = float(cmd.split("--head-fraction ", 1)[1].split(" ")[0])
+
             if "exit_code" in result:
                 assert error_level == result["exit_code"] or error_level == f"{result['exit_code']}:0", f"{error_level!r} {result['exit_code']!r}"
 
