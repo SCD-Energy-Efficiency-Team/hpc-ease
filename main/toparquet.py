@@ -9,15 +9,16 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
-from fetchjobs import get_all_jobs, get_jobs_from_db
+from datasetconfig import load_dataset_config_or_exit
+from fetchjobs import get_all_jobs, get_jobs_from_slurm_db
 from tqdm import tqdm
 
 faulthandler.register(signal.SIGQUIT)
 
 app = typer.Typer()
 
-def yield_jobs_per_window(window=timedelta(hours=24), showpb=True):
-    start_range, end_range = 1725608400, 1780351201
+def yield_jobs_per_window(config, window=timedelta(hours=24), showpb=True):
+    start_range, end_range = config.start_epoch, config.end_epoch
     start_range, end_range = (
         datetime.fromtimestamp(start_range, UTC),
         datetime.fromtimestamp(end_range, UTC),
@@ -31,7 +32,7 @@ def yield_jobs_per_window(window=timedelta(hours=24), showpb=True):
     for day in tqdm(windows, disable=not showpb):
         start_window = day.timestamp()
         end_window = (day + window).timestamp()
-        yield from get_jobs_from_db(start_window, end_window)
+        yield from get_jobs_from_slurm_db(start_window, end_window)
 
 def flatten_dict(d, parent_key="", sep="__"):
     items = []
@@ -98,11 +99,11 @@ def run_main(
         if batch_length is None:
             print("Full grab")
             filename = filename / "all_jobs_full.parquet"
-            job_generator = tqdm(get_all_jobs(), total=64209465)
+            job_generator = tqdm(get_all_jobs())
         else:
             print(f"Per window grab ({batch_length} hours at a time)")
             filename = filename / f"all_jobs_perwindow{batch_length}.parquet"
-            job_generator = yield_jobs_per_window(window=timedelta(hours=batch_length))
+            job_generator = yield_jobs_per_window(load_dataset_config_or_exit(), window=timedelta(hours=batch_length))
 
         # Adjust chunk size based on your RAM
         CHUNK_SIZE = 50000

@@ -10,6 +10,7 @@
 *.parquet
 *.log
 
+!example_graph.png
 !main/regional_carbon_intensity.csv
 
 *.db
@@ -19,6 +20,7 @@
 
 .env
 benchmark/clusters.toml
+dataset.toml
 graphs/
 
 ###

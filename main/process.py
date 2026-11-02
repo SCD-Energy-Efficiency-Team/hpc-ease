@@ -9,9 +9,11 @@ from bisect import bisect_left
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from functools import partial
 from pathlib import Path
 
 import typer
+from datasetconfig import DatasetConfigError, load_dataset_config
 from fetchcarbon import (
     DEFAULT_HEAD_FRACTION,
     DEFAULT_HEAD_WEIGHT,
@@ -20,9 +22,7 @@ from fetchcarbon import (
 from fetchcarbon import CarbonIntensityCSV as CarbonIntensityService
 from fetchjobs import (
     BATCH_SECONDS,
-    get_job_batches_from_db,
     get_job_batches_from_parquet,
-    get_jobs_from_db,
     get_jobs_from_parquet,
 )
 from scheduling import CarbonScheduler
@@ -42,9 +42,7 @@ DEFAULT_WARMUP_DAYS = 10.0
 
 app = typer.Typer()
 
-NODE_CORES = 192  # 2 sockets x 96 cores per node
-
-def calc_energy_of_job(job, p_idle=220, p_max=850):
+def calc_energy_of_job(job, cores_per_node, p_idle, p_max):
     elapsed_time = job["time"]["elapsed"]  # wall clock time
     cpu_time = float(job["time"]["total"])  # total cpu time
 
@@ -62,20 +60,35 @@ def calc_energy_of_job(job, p_idle=220, p_max=850):
     node_power = p_idle + u * (p_max - p_idle)
 
     # total cluster power used by job
-    total_power = (cpus_total / NODE_CORES) * node_power
+    total_power = (cpus_total / cores_per_node) * node_power
 
     energy_kwh = (total_power * (elapsed_time / 3600)) / 1000
     return energy_kwh
 
-def aggregate_jobs(jobs_iter, waits=None):
+def make_energy_fn(config):
+    return partial(calc_energy_of_job, cores_per_node=config.cluster.cores_per_node, p_idle=config.p_idle_w, p_max=config.p_max_w)
+
+def never_ran(job):
+    # Slurm records start and end as 0 for a job cancelled while still pending
+    return job["time"]["start"] == 0 or job["time"]["end"] == 0
+
+def without_never_ran(batches):
+    # the same filter for the rescheduled run, so both runs cover the same jobs
+    for batch_start_epoch, batch in batches:
+        yield batch_start_epoch, [job for job in batch if not never_ran(job)]
+
+def aggregate_jobs(jobs_iter, energy_fn, waits=None, skipped=None):
     jobs = defaultdict(list)
     min_start, max_end = float("inf"), float("-inf")
     for job in jobs_iter:
-        state, start, end = job["state"], job["time"]["start"], job["time"]["end"]
-        assert start != 0 and end != 0, f"{job['id_job']} {state} {start} {end}"
+        start, end = job["time"]["start"], job["time"]["end"]
+        if never_ran(job):
+            if skipped is not None:
+                skipped.append(job["id_job"])
+            continue
         min_start = min(min_start, start)
         max_end = max(max_end, end)
-        jobs[(start, end)].append(calc_energy_of_job(job))
+        jobs[(start, end)].append(energy_fn(job))
         if waits is not None:
             waits.append(start - job["time"]["submit"])
     return dict(jobs), min_start, max_end
@@ -92,8 +105,8 @@ def summarise_waits(waits, suffix=""):
         f"wait_negative{suffix}": sum(1 for w in ordered if w < 0),
     }
 
-def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file, waits=None):
-    return aggregate_jobs(get_jobs(start_time, end_time, jobs_file, by_submit_time), waits)
+def get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file, config, waits=None, skipped=None):
+    return aggregate_jobs(get_jobs(start_time, end_time, jobs_file, by_submit_time), make_energy_fn(config), waits, skipped)
 
 def aggregate_energies(placements):
     jobs = defaultdict(list)
@@ -105,44 +118,45 @@ def aggregate_energies(placements):
         jobs[(start, end)].append(energy)
     return dict(jobs), min_start, max_end
 
-def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, strict=False, reschedule_fraction=1.0, reschedule_seed=0,
+def get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, config, strict=False, reschedule_fraction=1.0, reschedule_seed=0,
                                    defer=False, retry_timeout=24.0, count_violations=False,
                                    warmup_days=0.0, cooldown_days=0.0):
-    scheduler = CarbonScheduler(cidservice, strict=strict, energy_fn=calc_energy_of_job, reschedule_fraction=reschedule_fraction, reschedule_seed=reschedule_seed,
+    energy_fn = make_energy_fn(config)
+    scheduler = CarbonScheduler(cidservice, config.cluster, strict=strict, energy_fn=energy_fn, reschedule_fraction=reschedule_fraction, reschedule_seed=reschedule_seed,
                                 defer=defer, retry_timeout=timedelta(hours=retry_timeout), count_violations=count_violations,
                                 measure_from=start_time if warmup_days else None, measure_until=end_time if cooldown_days else None)
     stream_start = start_time - warmup_days * 86400
     stream_end = end_time + cooldown_days * 86400
     num_batches = math.ceil((int(stream_end) - int(stream_start)) / BATCH_SECONDS)  # CHUNK_SECONDS is a multiple of BATCH_SECONDS
-    batches = tqdm(get_job_batches(stream_start, stream_end, jobs_file, by_submit_time), total=num_batches, desc="Rescheduling", unit="min", disable=None)
+    batches = tqdm(without_never_ran(get_job_batches(stream_start, stream_end, jobs_file, by_submit_time)), total=num_batches, desc="Rescheduling", unit="min", disable=None)
     for batch_start_epoch, batch in batches:
         scheduler.process_jobs(batch, batch_start_epoch)
     scheduler.finalize()
 
     horizon_stats = {
         "unschedulable_jobs": len(scheduler.unschedulable),
-        "unschedulable_energy": sum(calc_energy_of_job(job) for job in scheduler.unschedulable),
+        "unschedulable_energy": sum(energy_fn(job) for job in scheduler.unschedulable),
         "crowded_out_jobs": len(scheduler.crowded_out),
-        "crowded_out_energy": sum(calc_energy_of_job(job) for job in scheduler.crowded_out),
-        "left_alone_jobs": len(scheduler.left_alone),
+        "crowded_out_energy": sum(energy_fn(job) for job in scheduler.crowded_out),
+        "left_alone_jobs": scheduler.left_alone_count,
     }
     if defer:
         horizon_stats |= {
             "deferred_jobs": len(scheduler.deferred),
             "deferred_placed": len(scheduler.deferred) - len(scheduler.never_placed),
             "never_placed_jobs": len(scheduler.never_placed),
-            "never_placed_energy": sum(calc_energy_of_job(job) for job in scheduler.never_placed),
+            "never_placed_energy": sum(energy_fn(job) for job in scheduler.never_placed),
         }
     if count_violations:
         unschedulable_ids = {id(j) for j in scheduler.unschedulable}
         violating_unschedulable = [j for j in scheduler.violating_pins if id(j) in unschedulable_ids]
         horizon_stats |= {
             "violating_pin_jobs": len(scheduler.violating_pins),
-            "violating_pin_energy": sum(calc_energy_of_job(job) for job in scheduler.violating_pins),
+            "violating_pin_energy": sum(energy_fn(job) for job in scheduler.violating_pins),
             "violating_pin_jobs_unschedulable": len(violating_unschedulable),
-            "violating_pin_energy_unschedulable": sum(calc_energy_of_job(job) for job in violating_unschedulable),
+            "violating_pin_energy_unschedulable": sum(energy_fn(job) for job in violating_unschedulable),
             "unverifiable_pin_jobs": len(scheduler.unverifiable_pins),
-            "unverifiable_pin_energy": sum(calc_energy_of_job(job) for job in scheduler.unverifiable_pins),
+            "unverifiable_pin_energy": sum(energy_fn(job) for job in scheduler.unverifiable_pins),
         }
     waits = list(scheduler.output_waits())
     if waits:
@@ -198,7 +212,7 @@ def get_graph_data(jobs, min_start, max_end, cidservice):
     if limitstart == limitend:
         # Zero-width range: the lookup loop never terminates on it.
         return []
-    carbon_intensity = cidservice.get_climate_data(limitstart, limitend, "OX11", "forecast")
+    carbon_intensity = cidservice.get_climate_data(limitstart, limitend, "forecast")
 
     limitstart, limitend = datetime.fromisoformat(limitstart), datetime.fromisoformat(limitend)
     period_bounds = list(iter_periods(limitstart, limitend))
@@ -354,7 +368,7 @@ def run_main(
     graph_mode: GraphMode = GraphMode.save_graph,
     print_json: bool = False,
     do_ask: bool = True,
-    jobs_file: str | None = None,
+    jobs_file: str | None = None,  # Parquet file of jobs, required; create it with toparquet.py
     strict: bool = False,  # raise VirtualCapacityExhausted instead of pinning crowded-out jobs
     head_weight: float = DEFAULT_HEAD_WEIGHT,  # window-scoring weight on the first part of a window; 1.0 = flat
     head_fraction: float = DEFAULT_HEAD_FRACTION,
@@ -367,7 +381,10 @@ def run_main(
     warmup_days: float = DEFAULT_WARMUP_DAYS,  # unmeasured days run first; 0 for an empty start
     cooldown_days: float | None = None,  # unmeasured days run after; default is the retry timeout in days with --defer, 0 otherwise
     dump_periods: str | None = None,  # JSON file for the before/after 5-minute series
+    dataset_config: str | None = None,  # TOML for the cluster, carbon CSV and dataset span; default dataset.toml in the repo root
 ):
+    if not jobs_file:
+        raise typer.BadParameter("a Parquet file of jobs is required; create one with toparquet.py", param_hint="--jobs-file")
     choose_random = chosen_day is None
     duration_to_fetch = timedelta(days=days_to_fetch)
     if chosen_day is not None:
@@ -383,18 +400,19 @@ def run_main(
         raise typer.BadParameter("--dump-periods needs the rescheduled run; drop --no-compare-algorithm")
     if dump_periods and (not warmup_days or (defer and not cooldown_days)):
         logger.warning("--dump-periods with warm-up or cool-down 0: the saving is inflated by the empty cluster at the window edges")
-    cidservice = CarbonIntensityService(head_fraction=head_fraction, head_weight=head_weight, max_wait_hours=max_wait)
+    try:
+        config = load_dataset_config(dataset_config, check_carbon=True)
+    except DatasetConfigError as error:
+        raise typer.BadParameter(str(error), param_hint="--dataset-config")
+    cidservice = CarbonIntensityService(config.carbon_csv, config.carbon_column, config.forecast_horizon_hours, head_fraction=head_fraction, head_weight=head_weight, max_wait_hours=max_wait)
 
     print(" ".join(sys.argv))
 
-    if jobs_file:
-        get_jobs, get_job_batches = get_jobs_from_parquet, get_job_batches_from_parquet
-    else:
-        get_jobs, get_job_batches = get_jobs_from_db, get_job_batches_from_db
+    get_jobs, get_job_batches = get_jobs_from_parquet, get_job_batches_from_parquet
 
     while True:
         if choose_random:
-            random_timestamp = random.randint(1725608400, 1780351201)
+            random_timestamp = random.randint(config.start_epoch, config.end_epoch)
             random_date = datetime.fromtimestamp(random_timestamp, tz=UTC)
             random_date = random_date.replace(hour=0, minute=0, second=0, microsecond=0)
             logger.info(f"Chosen random date: {random_date}")
@@ -404,7 +422,8 @@ def run_main(
         start_time = chosen_day.timestamp()
         end_time = (chosen_day + duration_to_fetch).timestamp()
         waits = []
-        jobs, min_start, max_end = get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file, waits)
+        never_ran_ids = []
+        jobs, min_start, max_end = get_jobs_and_energy(start_time, end_time, by_submit_time, get_jobs, jobs_file, config, waits, never_ran_ids)
         num_jobs = sum(len(group) for group in jobs.values())
         logger.info(f"Total number of jobs: {num_jobs}")
         if not print_json and do_ask:
@@ -422,11 +441,13 @@ def run_main(
 
     result_json = {"num_jobs": num_jobs, "chosen_day": chosen_day.isoformat(), "days_to_fetch": days_to_fetch}
     if num_jobs == 0:
+        if never_ran_ids:
+            result_json["never_ran_skipped"] = len(never_ran_ids)
         print(json.dumps(result_json))
         sys.exit()
     if compare_algorithm:
         logger.info("Running alternative scheduling algorithm...")
-        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, strict=strict, reschedule_fraction=reschedule_percent / 100, reschedule_seed=reschedule_seed, defer=defer, retry_timeout=retry_timeout, count_violations=count_violations, warmup_days=warmup_days, cooldown_days=cooldown_days)
+        jobs2, min_start2, max_end2, horizon_stats = get_jobs_and_energy_reschedule(start_time, end_time, by_submit_time, get_job_batches, jobs_file, cidservice, config, strict=strict, reschedule_fraction=reschedule_percent / 100, reschedule_seed=reschedule_seed, defer=defer, retry_timeout=retry_timeout, count_violations=count_violations, warmup_days=warmup_days, cooldown_days=cooldown_days)
         periods2 = get_graph_data(jobs2, min_start2, max_end2, cidservice)
         if dump_periods:
             dump_periods_json(dump_periods, cidservice, chosen_day, days_to_fetch, periods, periods2, horizon_stats)
@@ -468,8 +489,12 @@ def run_main(
 
     if not print_json:
         print("\n".join(stats))
+        if never_ran_ids:
+            print(f"Skipped {len(never_ran_ids)} job(s) in the window that never ran (start or end time 0), in both the original and the rescheduled run")
     else:
         result_json |= stats
+        if never_ran_ids:
+            result_json["never_ran_skipped"] = len(never_ran_ids)
         print(json.dumps(result_json))
 
 if __name__ == "__main__":

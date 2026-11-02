@@ -17,6 +17,12 @@ import typer
 from tqdm import tqdm
 
 project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root / "main"))
+from datasetconfig import (
+    DEFAULT_DATASET_CONFIG,
+    DatasetConfigError,
+    load_dataset_config,
+)
 
 app = typer.Typer()
 
@@ -48,14 +54,9 @@ def run_slurm(cmd):
         tqdm.write(f"{cmd[0]} took {took:.0f}s")
     return result, None
 
-# before this the dataset is mostly test traffic, not user jobs
-DEFAULT_FROM_DATE = "2025-02-01"
-
 DEFAULT_WARMUP_DAYS = 10.0
 # process.py's --retry-timeout default
 PROCESS_DEFAULT_RETRY_TIMEOUT_HOURS = 72.0
-
-DATASET_END = datetime.fromtimestamp(1780351201, tz=UTC)
 
 def parse_walltime(text):
     """Slurm [D-]HH:MM:SS to seconds."""
@@ -123,21 +124,36 @@ def build_process_cmd(day_string, days_to_fetch, project_folder, jobs_file, *, h
     cmd += ["--warmup-days", str(warmup_days), "--cooldown-days", str(cooldown_days)]
     if dump_periods_dir is not None:
         cmd += ["--dump-periods", str(Path(dump_periods_dir) / f"{day_string}_{days_to_fetch}d.json")]
+    cmd += snapshot_dataset_args(project_folder)
     return cmd
 
-def get_days():
-    start_range, end_range = 1725608400, 1780351201
-    start_range, end_range = datetime.fromtimestamp(start_range, tz=UTC), datetime.fromtimestamp(end_range, tz=UTC)
-    start_window = start_range.replace(hour=0, minute=0, second=0, microsecond=0)
+def snapshot_dataset_args(project_folder):
+    """--dataset-config for the snapshot's own frozen copy, or nothing for an older --commit that has no such flag."""
+    if (project_folder / "main/datasetconfig.py").is_file():
+        return ["--dataset-config", str(project_folder / "dataset.toml")]
+    return []
+
+def get_days(config):
+    start_window = config.start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_range = config.end
     days = []
     while start_window < end_range:
         days.append(start_window)
         start_window += timedelta(days=1)
     return days
 
+def find_task_spooler(ts_binary):
+    """--ts-binary if given, else `tsp` on PATH; a bare `ts` is never guessed because it may be moreutils'."""
+    if ts_binary is not None:
+        return ts_binary
+    found = shutil.which("tsp")
+    if found:
+        return Path(found)
+    raise typer.BadParameter("no `tsp` on PATH; install Task Spooler, or pass its binary (a `ts` too) with --ts-binary", param_hint="--ts-binary")
+
 class TaskSpooler:
-    def __init__(self):
-        self.TS_BINARY = project_root.parent / "task-spooler/ts"
+    def __init__(self, ts_binary=None):
+        self.TS_BINARY = find_task_spooler(ts_binary)
 
     def run_cmd(self, params, get_output=False):
         cmd = [self.TS_BINARY] + params
@@ -188,7 +204,7 @@ class Slurm:
         self.pending_states = {}  # unfinished job id -> state from the last check_queue
 
     def build_cmd(self, day_string, days_to_fetch, project_folder, jobs_file, **flags):
-        assert jobs_file is not None, "get_from_db should not work on Slurm"
+        assert jobs_file is not None, "--jobs-file is required"
         route = self.route
         mem, duration, qos = route_resources(route, days_to_fetch + flags["warmup_days"] + flags["cooldown_days"])
         slurm_part = [
@@ -274,7 +290,7 @@ class Slurm:
         shown = list(self.pending_states.items())[:limit]
         return ", ".join(f"{job_id} {state}" for job_id, state in shown) + (", ..." if len(self.pending_states) > limit else "")
 
-def make_snapshot(snapshots_root, commit=None):
+def make_snapshot(snapshots_root, config, config_path, commit=None):
     snapshots_root.mkdir(exist_ok=True)
     start = time.time()
     while True:
@@ -313,6 +329,14 @@ def make_snapshot(snapshots_root, commit=None):
         )
         subprocess.run(["tar", "-x"], cwd=snap, input=archive.stdout, check=True)
 
+    # the configured carbon CSV and the config itself may be gitignored (git archive skips them): freeze both into the snapshot
+    if config.carbon_csv.is_relative_to(project_root):
+        csv_in_snap = snap / config.carbon_csv.relative_to(project_root)
+        csv_in_snap.parent.mkdir(parents=True, exist_ok=True)
+        if config.carbon_csv.is_file() and not csv_in_snap.is_file():
+            shutil.copy(config.carbon_csv, csv_in_snap)
+    shutil.copy(config_path, snap / "dataset.toml")
+
     try:
         subprocess.run(
             ["uv", "sync"],
@@ -330,7 +354,6 @@ def make_snapshot(snapshots_root, commit=None):
 
 @app.command()
 def run_main(
-    only_one_day: bool = True,
     jobs_file: Annotated[
         Path | None,
         typer.Option(
@@ -343,6 +366,10 @@ def run_main(
     ] = None,
     use_slurm: bool = False,
     debug: bool = False,
+    dataset_config: Annotated[
+        Path,
+        typer.Option(help="TOML describing the cluster, carbon CSV and dataset span (see dataset.example.toml); a copy is frozen into the snapshot and passed to every run"),
+    ] = DEFAULT_DATASET_CONFIG,
     commit: Annotated[
         str | None,
         typer.Option(help="Benchmark this git commit/branch/tag instead of the working tree"),
@@ -355,6 +382,10 @@ def run_main(
         Path,
         typer.Option(dir_okay=False, resolve_path=True, help="TOML describing the Slurm routes; see clusters.example.toml"),
     ] = DEFAULT_CLUSTERS_FILE,
+    ts_binary: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, resolve_path=True, help="Task Spooler binary for local runs; default is `tsp` on PATH"),
+    ] = None,
     exclude_nodes: Annotated[
         list[str] | None,
         typer.Option(help="Slurm nodes to exclude, replacing the route's `exclude` list"),
@@ -376,12 +407,13 @@ def run_main(
     ] = None,
     days_to_fetch: Annotated[
         list[int] | None,
-        typer.Option(help="Span(s) in days; repeat the flag for several. Overrides --only-one-day."),
+        typer.Option(help="Span(s) in days; repeat the flag for several. Default: 1."),
     ] = None,
     from_date: Annotated[
         str | None,
         typer.Option(
-            help=f"Only submit days on or after this date (YYYY-MM-DD); default is {DEFAULT_FROM_DATE}, except that --dates-file is used as given"
+            help="Only submit days on or after this date (YYYY-MM-DD), judged on each run's start day. "
+            "Defaults to the dataset config's from_date, except that --dates-file is used as given."
         ),
     ] = None,
     no_from_date: Annotated[
@@ -444,10 +476,19 @@ def run_main(
         ),
     ] = False,
 ):
+    try:
+        config = load_dataset_config(dataset_config, check_carbon=True)
+    except DatasetConfigError as error:
+        raise typer.BadParameter(str(error), param_hint="--dataset-config")
+    dataset_end = config.end
+
+    if jobs_file is None:
+        raise typer.BadParameter("a Parquet file of jobs is required; create one with toparquet.py", param_hint="--jobs-file")
+
     if not use_slurm:
-        jobscheduler = TaskSpooler()
+        jobscheduler = TaskSpooler(ts_binary)
+        print(f"Task Spooler: {jobscheduler.TS_BINARY}")
     else:
-        assert jobs_file is not None, "get_from_db should not work on Slurm"
         slurm_route = load_route(clusters_file, route)
         if no_exclude:
             exclude_nodes = []
@@ -455,21 +496,17 @@ def run_main(
             exclude_nodes = slurm_route["exclude"]
         jobscheduler = Slurm(slurm_route, exclude_nodes)
         print(f"Slurm route {slurm_route['name']} from {clusters_file}")
+        Path("slurmoutputs").mkdir(exist_ok=True)  # sbatch -o does not create it, and results are read back from it
 
     assert graph_mode in ("no-graph", "save-graph"), "--graph-mode must be no-graph or save-graph (show-graph needs a display)"
     combos = []
 
-    if days_to_fetch:
-        days_to_fetch_list = days_to_fetch
-    elif only_one_day:
-        days_to_fetch_list = [1]
-    else:
-        days_to_fetch_list = [1, 2, 4, 7]
+    days_to_fetch_list = days_to_fetch or [1]
 
     if dates_file is not None:
         dates = [line.strip() for line in dates_file.read_text().splitlines() if line.strip()]
     else:
-        days = get_days()
+        days = get_days(config)
         dates = [day.date().isoformat() for day in days]
     if cooldown_days is None:
         timeout_hours = retry_timeout if retry_timeout is not None else PROCESS_DEFAULT_RETRY_TIMEOUT_HOURS
@@ -477,7 +514,7 @@ def run_main(
     print(f"warm-up {warmup_days:g} days, cool-down {cooldown_days:g} days")
 
     if from_date is None and dates_file is None:
-        from_date = DEFAULT_FROM_DATE
+        from_date = config.from_date.isoformat()
     if from_date is not None and not no_from_date:
         cutoff = pd.Timestamp(from_date)
         kept = [date for date in dates if pd.Timestamp(date) >= cutoff]
@@ -496,12 +533,12 @@ def run_main(
             if ends and datetime.now() + timedelta(seconds=parse_walltime(duration)) > datetime.fromisoformat(ends):
                 print(f"WARNING: a {duration} job submitted now would run past the route's `ends` ({ends}), so Slurm will leave it pending")
 
-    snapshot_folder, commit_hash = make_snapshot(Path.home() / "cprojsnaps", commit=commit)
+    snapshot_folder, commit_hash = make_snapshot(Path.home() / "cprojsnaps", config, dataset_config, commit=commit)
 
     for span in days_to_fetch_list:
         span_dates = dates
         if not keep_truncated:
-            end_cutoff = DATASET_END.replace(tzinfo=None) - timedelta(days=span + cooldown_days)
+            end_cutoff = dataset_end.replace(tzinfo=None) - timedelta(days=span + cooldown_days)
             span_dates = [date for date in dates if pd.Timestamp(date) <= end_cutoff]
             print(f"{span}d: skipped {len(dates) - len(span_dates)} of {len(dates)} dates whose window plus cool-down ends after the dataset")
         for date in span_dates:
@@ -578,6 +615,7 @@ def run_main(
     if retry_timeout is not None:
         suffix += f"-rt{retry_timeout:g}"
     suffix += f"-wu{warmup_days:g}-cd{cooldown_days:g}"
+    Path("temp").mkdir(exist_ok=True)
     while True:
         random_filename = f"temp/{int(time.time()*1000)!s}{suffix}.txt"
         if not os.path.isfile(random_filename):

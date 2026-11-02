@@ -1,15 +1,21 @@
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "main"))
+from datasetconfig import load_dataset_config_or_exit
+
 KEY = ["chosen_day", "days_to_fetch"]
 
-# end of the dataset (second of the epoch pair duplicated across the repo), naive UTC like chosen_day
-DATASET_END = pd.Timestamp(1780351201, unit="s")
-DATASET_START = pd.Timestamp(1725608400, unit="s").normalize()
+# span of the dataset from dataset.toml, naive UTC like chosen_day
+_dataset = load_dataset_config_or_exit()
+DATASET_END = pd.Timestamp(_dataset.end_epoch, unit="s")
+DATASET_START = pd.Timestamp(_dataset.start_epoch, unit="s").normalize()
 MAX_SLICES_LISTED = 14
 
 STAT_LABELS = [

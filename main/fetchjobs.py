@@ -1,15 +1,27 @@
-try:
-    import mariadb
-except ImportError as e:
-    pass
-    # print(f"WARNING: Failed to import MariaDB, may cause crash if required... ({e})")
-
 import math
 from collections import defaultdict
 
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
+import pymysql
+import pymysql.cursors
 from dotenv import dotenv_values
+
+DEFAULT_DB_SOCKET = "/var/lib/mysql/mysql.sock"
+DEFAULT_DB_PORT = 3306
+
+
+def db_connect_kwargs(creds, database_key):
+    # DB_HOST (+ optional DB_PORT) means TCP; otherwise DB_SOCKET, else the default socket
+    kwargs = {"user": creds["DB_USERNAME"], "password": creds["DB_PASSWORD"], "database": creds[database_key]}
+    if creds.get("DB_HOST"):
+        return {**kwargs, "host": creds["DB_HOST"], "port": int(creds.get("DB_PORT") or DEFAULT_DB_PORT)}
+    return {**kwargs, "unix_socket": creds.get("DB_SOCKET") or DEFAULT_DB_SOCKET}
+
+
+def connect_db(creds, database_key):
+    return pymysql.connect(**db_connect_kwargs(creds, database_key))
+
 
 STATES = [
     "PENDING", # 0
@@ -67,47 +79,47 @@ def job_row_to_dict(row):
 
 ###
 
-def get_all_jobs():
-    creds = dotenv_values("../.env")
-    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["PROCESSED_DATABASE"])
-    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
-        query = f"SELECT * FROM {creds['PROCESSED_TABLE']}"
-        cursor.execute(query)
-        for row in cursor:
-            yield job_row_to_dict(row)
-
-def get_all_jobs_from_parquet(filename):
-    dataset = ds.dataset(filename, format="parquet")
-    scanner = dataset.scanner()
-    for record_batch in scanner.to_batches():
-        yield from record_batch.to_pylist()
-
-def get_jobs_from_db(start_window, end_window, jobs_file=None, by_submit_time=True):
-    assert by_submit_time, "Shouldn't be using start and end time"
-    creds = dotenv_values("../.env")
-    conn = mariadb.connect(unix_socket="/var/lib/mysql/mysql.sock", user=creds["DB_USERNAME"], password=creds["DB_PASSWORD"], database=creds["PROCESSED_DATABASE"])
-    with conn, conn.cursor(dictionary=True, buffered=False) as cursor:
-        if by_submit_time:
-            where_clause = "job_table.time_submit >= %s AND job_table.time_submit < %s"
-        else:
-            where_clause = "job_table.time_end >= %s AND job_table.time_end <= %s AND job_table.time_start >= %s"
-        
-        query = f"""
+def _slurm_jobs_query(creds, where_clause):
+    return f"""
             SELECT
-                *
-            FROM 
-                {creds["PROCESSED_TABLE"]} job_table
+                job_table.job_db_inx AS job_db_inx,
+                job_table.id_job AS id_job,
+                job_table.state AS state,
+                job_table.time_start AS time_start,
+                job_table.time_end AS time_end,
+                job_table.time_submit AS time_submit,
+                job_table.tres_alloc AS tres_alloc,
+                job_table.tres_req AS tres_req,
+                job_table.timelimit AS timelimit,
+                CAST(SUM((step_table.user_sec * 1000000) + step_table.user_usec + (step_table.sys_sec * 1000000) + step_table.sys_usec) AS DECIMAL(65, 6)) / 1000000 AS total_cpu_time
+            FROM
+                {creds["JOB_TABLE"]} job_table
+            JOIN
+                {creds["STEP_TABLE"]} step_table ON job_table.job_db_inx = step_table.job_db_inx
             WHERE
                 {where_clause}
+            GROUP BY
+                job_table.job_db_inx
             ORDER BY
                 job_table.job_db_inx ASC
         """
 
-        if by_submit_time:
-            cursor.execute(query, (start_window, end_window))
-        else:
-            cursor.execute(query, (start_window, end_window, start_window))
+def get_jobs_from_slurm_db(start_window, end_window):
+    # raw Slurm accounting tables: only time_submit is indexed, so select by a submit window
+    creds = dotenv_values("../.env")
+    conn = connect_db(creds, "MAIN_DATABASE")
+    with conn, conn.cursor(pymysql.cursors.SSDictCursor) as cursor:
+        query = _slurm_jobs_query(creds, "job_table.time_submit >= %s AND job_table.time_submit < %s AND job_table.state = 3")
+        cursor.execute(query, (int(start_window), int(end_window)))
+        for row in cursor:
+            yield job_row_to_dict(row)
 
+def get_all_jobs():
+    # every COMPLETED job in one query over the raw Slurm tables; state has no index, so this scans the whole job table
+    creds = dotenv_values("../.env")
+    conn = connect_db(creds, "MAIN_DATABASE")
+    with conn, conn.cursor(pymysql.cursors.SSDictCursor) as cursor:
+        cursor.execute(_slurm_jobs_query(creds, "job_table.state = 3"))
         for row in cursor:
             yield job_row_to_dict(row)
 
@@ -148,11 +160,3 @@ def get_job_batches_from_parquet(start_window, end_window, filename, by_submit_t
 
     yield from _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows)
 
-
-def get_job_batches_from_db(start_window, end_window, jobs_file=None, by_submit_time=True, batch_seconds=BATCH_SECONDS):
-    assert by_submit_time, "Shouldn't be using start and end time"
-
-    def fetch_chunk_rows(chunk_start, chunk_end):
-        return get_jobs_from_db(chunk_start, chunk_end, jobs_file, by_submit_time)
-
-    yield from _iter_job_batches(start_window, end_window, batch_seconds, fetch_chunk_rows)

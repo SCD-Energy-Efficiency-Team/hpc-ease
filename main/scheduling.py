@@ -3,7 +3,7 @@ from bisect import bisect_left, bisect_right
 from datetime import UTC, datetime, timedelta
 from functools import cmp_to_key
 
-from fetchcarbon import FORECAST_HORIZON, round_to_30min
+from fetchcarbon import round_to_30min
 from tqdm import tqdm
 
 PIN_IF_FEWER_WINDOWS_THAN = 2
@@ -22,14 +22,10 @@ def _effective_end(job, time_start, time_end):
 
 
 class Node:
-    def __init__(self):
+    def __init__(self, cap_cores, cap_mem):
         # TODO: Could set these arbitrarily ridiculously high, to show imaginary lowest possible
-        self.NUM_CPUS = 2
-        self.NUM_CORES_PER_CPU = 96
-        self.MEM_GIB = 1536
-
-        self.cap_cores = self.NUM_CPUS * self.NUM_CORES_PER_CPU
-        self.cap_mem = self.MEM_GIB * 1024
+        self.cap_cores = cap_cores
+        self.cap_mem = cap_mem  # MiB
 
         # usage skyline: on [_sky_t[i], _sky_t[i+1]) the node holds _sky_cores[i] cores and _sky_mem[i] MiB
         self._sky_t = []
@@ -89,23 +85,21 @@ class Node:
             del self._sky_t[:keep_from], self._sky_cores[:keep_from], self._sky_mem[:keep_from]
 
 
-def job_footprint(job):
-    # TODO: Currently hardcoded to JASMIN's identical nodes
-    cpu_frac = job["req"]["cpu"] / (2 * 96)
-    mem_frac = job["req"]["mem"] / (1536 * 1024)
+def job_footprint(job, cap_cores, cap_mem):
+    cpu_frac = job["req"]["cpu"] / cap_cores
+    mem_frac = job["req"]["mem"] / cap_mem
     return job["timelimit"] * max(cpu_frac, mem_frac)
 
 
-def job_comparator(a, b):
-    return job_footprint(b) - job_footprint(a)
-
-
 class CarbonScheduler:
-    def __init__(self, cidservice, strict=False, energy_fn=None, reschedule_fraction=1.0, reschedule_seed=0,
+    def __init__(self, cidservice, cluster, strict=False, energy_fn=None, reschedule_fraction=1.0, reschedule_seed=0,
                  defer=False, retry_timeout=timedelta(hours=24), count_violations=False,
                  measure_from=None, measure_until=None):
-        self.NUM_NODES = 255
-        self.nodes = [Node() for node in range(self.NUM_NODES)]
+        self.NUM_NODES = cluster.nodes
+        cap_cores, cap_mem = cluster.cores_per_node, cluster.mem_gib_per_node * 1024
+        self.nodes = [Node(cap_cores, cap_mem) for node in range(self.NUM_NODES)]
+        self._footprint_order = cmp_to_key(lambda a, b: job_footprint(b, cap_cores, cap_mem) - job_footprint(a, cap_cores, cap_mem))
+        self.forecast_horizon = timedelta(hours=cidservice.forecast_horizon_hours)
         self.cidservice = cidservice
         self.strict = strict  # raise VirtualCapacityExhausted instead of pinning crowded-out jobs
         self._watermark = None
@@ -115,7 +109,7 @@ class CarbonScheduler:
         self.reschedule_fraction = reschedule_fraction  # share of jobs the scheduler may move; the rest keep their original start
         self.unschedulable = []
         self.crowded_out = []
-        self.left_alone = []
+        self.left_alone_count = 0
         self.defer = defer  # queue crowded-out jobs and retry them as the forecast horizon advances
         self.retry_timeout = retry_timeout  # max time a deferred job stays unplaced (now - submit)
         self.check_pins = count_violations
@@ -171,7 +165,10 @@ class CarbonScheduler:
 
     def _pin_unschedulable(self, job, crowded_out=False, left_alone=False):
         if self._measured(job):
-            (self.left_alone if left_alone else self.crowded_out if crowded_out else self.unschedulable).append(job)
+            if left_alone:
+                self.left_alone_count += 1  # a counter, not the job, so unmoved jobs don't stay in memory
+            else:
+                (self.crowded_out if crowded_out else self.unschedulable).append(job)
         self._pin(job, check=not left_alone)  # a left-alone job stays put by design, so it is never a violation
 
     def _pin_never_placed(self, job):
@@ -261,8 +258,7 @@ class CarbonScheduler:
     def _retry_pending(self, now):
         max_wait = getattr(self.cidservice, "max_wait", None)
         still_pending = []
-        footprint_order = cmp_to_key(job_comparator)
-        for job, horizon_end, original_score in sorted(self.pending, key=lambda item: footprint_order(item[0])):
+        for job, horizon_end, original_score in sorted(self.pending, key=lambda item: self._footprint_order(item[0])):
             submit_time = datetime.fromtimestamp(job["time"]["submit"], tz=UTC)
             last_start = None
             if max_wait is not None:
@@ -326,7 +322,7 @@ class CarbonScheduler:
                     self._pin_unschedulable(job, left_alone=True)
             jobs = moved
 
-        jobs = sorted(jobs, key=cmp_to_key(job_comparator))
+        jobs = sorted(jobs, key=self._footprint_order)
         for job in tqdm(jobs, leave=False, disable=None):
             num_nodes_req = job["req"]["node"]
 
@@ -335,7 +331,7 @@ class CarbonScheduler:
                 continue
 
             # avoids overflow in yield_lowest_periods for unbounded/huge timelimits
-            if timedelta(minutes=job["timelimit"]) > FORECAST_HORIZON:
+            if timedelta(minutes=job["timelimit"]) > self.forecast_horizon:
                 self._pin_unschedulable(job)
                 continue
 

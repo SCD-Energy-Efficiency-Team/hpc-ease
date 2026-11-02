@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from tqdm import tqdm
 
 def process(filename):
     rows = []
@@ -31,21 +32,15 @@ def process(filename):
             else:
                 result |= json.loads(output[-1])
                 joined_output = "\n".join(output)
-                if '❱ 59 │   │   │   assert job["req"]["node"] == 1' in joined_output and "AssertionError" in joined_output:
-                    result["error_type"] = "more_than_one_node"
-                elif "MissingCarbonData: Missing data for" in joined_output:
+                if "MissingCarbonData: Missing data for" in joined_output:
                     result["error_type"] = "missing_carbon_data"
-                elif "VirtualCapacityExhausted" in joined_output or "❱ 70 │   │   │   assert len(available) == num_nodes_req" in joined_output:
+                elif "VirtualCapacityExhausted" in joined_output:
                     result["error_type"] = "virtual_capacity_exhausted"
                 elif "Parquet magic bytes not found in footer" in joined_output:
                     result["error_type"] = "parquet_corrupted_db"
-                elif "OverflowError: date value out of range" in joined_output:
-                    # fixed at the source; kept for reprocessing pre-fix temp/ runs
-                    result["error_type"] = "timelimit_overflow"
                 elif (
-                    ("this a 'parquet' file?: Failed to open local file" in joined_output
-                     and "Detail: [errno 2] No such file or directory" in joined_output)
-                    or ("FileNotFoundError" in joined_output and "_ensure_single_source" in joined_output)
+                    "this a 'parquet' file?: Failed to open local file" in joined_output
+                    and "Detail: [errno 2] No such file or directory" in joined_output
                 ):
                     result["error_type"] = "parquet_went_missing"
                 else:
@@ -125,11 +120,12 @@ def process(filename):
 
     serialized_data = json.dumps({"keys": keys, "rows": rows}, sort_keys=True)
     hashofdata = hashlib.sha256(serialized_data.encode("utf-8")).hexdigest()
+    Path("processed").mkdir(exist_ok=True)
     with open(f"processed/{filename.stem}-{hashofdata[0:12]}.csv", "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
 
 if __name__ == "__main__":
-    for filename in Path("temp").glob("*.txt"):
+    for filename in tqdm(list(Path("temp").glob("*.txt"))):
         process(filename)

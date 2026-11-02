@@ -1,0 +1,29 @@
+# Describes the historical job dataset and the cluster it came from. Copy to dataset.toml (git-ignored) and edit.
+# Scripts read dataset.toml in the repo root; main/process.py and benchmark/runmultiple.py also take --dataset-config PATH.
+# Not to be confused with benchmark/clusters.toml, which says where the benchmark's Slurm jobs run.
+
+[cluster]
+# The simulated cluster (every node is identical)
+nodes = 100
+cores_per_node = 128        # cores a node offers to jobs (all sockets)
+mem_gib_per_node = 512      # memory per node
+
+[energy]
+# Linear power model per node: p_idle_w + utilisation * (p_max_w - p_idle_w), scaled by cores held / cores_per_node.
+p_idle_w = 200
+p_max_w = 700
+
+[carbon]
+# CSV with a `datetime` column (ISO, UTC) of 30-minute slots and one gCO2/kWh column per region.
+# The slot length is fixed at 30 minutes: hourly data must be repeated into two slots.
+csv = "main/regional_carbon_intensity.csv"   # relative to the repo root
+column = "My Region"                          # the column to use
+# how far ahead a scheduler could see the grid, and the longest job it will move (the UK API forecasts 96 hours)
+forecast_horizon_hours = 96
+
+[dataset]
+# Span of the job data: epoch seconds or TOML datetimes (UTC). Jobs outside it are never requested.
+start = 2024-01-01T00:00:00Z
+end = 2025-12-31T23:59:59Z
+# Earliest date to analyse by default. Use it to skip a test or ramp-up period at the start of the data.
+from_date = 2024-01-01

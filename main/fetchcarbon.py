@@ -5,26 +5,15 @@ import math
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from pathlib import Path
-
-import dataset
-import requests
-from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-BASE = "https://api.carbonintensity.org.uk"
-
-FORECAST_HORIZON = timedelta(hours=96)
 
 DEFAULT_HEAD_FRACTION = 0.25
 DEFAULT_HEAD_WEIGHT = 4.0  # 1.0 = flat score (unchanged behaviour)
 
 YIELD_CACHE_SIZE = 4096
 CLIMATE_CACHE_SIZE = 512
-
-project_root = Path(__file__).resolve().parent.parent
 
 def gen_iso_string(epoch_time):
     return datetime.fromtimestamp(epoch_time, tz=UTC).strftime("%Y-%m-%dT%H:%MZ")
@@ -41,16 +30,6 @@ def round_to_30min(epoch_time, up, iso=True):
 
 def get_rounded_iso_range(start_epoch, end_epoch):
     return round_to_30min(start_epoch, False), round_to_30min(end_epoch, True)
-
-def parse_time_inputs(start, end):
-    assert type(start) is type(end)
-    thetype = type(start)
-    if thetype is str:
-        return start, end
-    elif thetype is int:
-        return get_rounded_iso_range(start, end)
-    else:
-        raise Exception(thetype)
 
 class MissingCarbonData(Exception):
     pass
@@ -114,38 +93,39 @@ class CarbonIntensity:
     head_fraction = DEFAULT_HEAD_FRACTION
     head_weight = DEFAULT_HEAD_WEIGHT
     max_wait = None  # timedelta: latest window start after the floored submit time; None = whole horizon
+    # subclasses set self.forecast_horizon_hours (from dataset.toml's [carbon] section)
 
-    def _get_climate_data(self, start, end, postcode="OX11", returnvalues="forecast"):
+    def _get_climate_data(self, start, end, returnvalues="forecast"):
         # returns {(start_datetime, end_datetime): intensityint, ...}
         raise NotImplementedError
 
-    def score_window(self, start_datetime, duration: int, postcode="OX11"):
+    def score_window(self, start_datetime, duration: int):
         # same weighted score yield_lowest_periods ranks by, for an arbitrary (not grid-aligned) window;
         # calls the uncached _get_climate_data so one-off keys don't evict the horizon queries
         start_epoch = start_datetime.timestamp()
         end_epoch = start_epoch + duration
         limitstart, limitend = get_rounded_iso_range(int(start_epoch), int(end_epoch))
-        prefix = build_intensity_prefix(self._get_climate_data(limitstart, limitend, postcode, "forecast"))
+        prefix = build_intensity_prefix(self._get_climate_data(limitstart, limitend, "forecast"))
         score, _ = calculate_weighted_intensity(
             start_datetime, start_datetime + timedelta(seconds=duration),
             prefix, build_intensity_cumsum(prefix), self.head_fraction, self.head_weight,
         )
         return score
 
-    def yield_lowest_periods(self, start_datetime, duration: int, postcode="OX11"):
+    def yield_lowest_periods(self, start_datetime, duration: int):
         start_datetime = min(start_datetime, datetime.now(tz=UTC))
         epoch = start_datetime.timestamp()
         return self._yield_lowest_periods_cached(
-            round_to_30min(epoch, False, iso=False), epoch % 1800 == 0, duration, postcode
+            round_to_30min(epoch, False, iso=False), epoch % 1800 == 0, duration
         )
 
-    def _yield_lowest_periods(self, floored_epoch, is_grid_aligned, duration: int, postcode="OX11"):
+    def _yield_lowest_periods(self, floored_epoch, is_grid_aligned, duration: int):
         # returns a list, with each item being:
         # (window_intensityint, start_datetime, end_datetime)
 
         limitstart = gen_iso_string(floored_epoch)
-        limitend = gen_iso_string(floored_epoch + int(FORECAST_HORIZON.total_seconds()) + (0 if is_grid_aligned else 1800))
-        carbon_intensity = self.get_climate_data(limitstart, limitend, postcode, "forecast")
+        limitend = gen_iso_string(floored_epoch + int(self.forecast_horizon_hours * 3600) + (0 if is_grid_aligned else 1800))
+        carbon_intensity = self.get_climate_data(limitstart, limitend, "forecast")
         carbon_prefix = build_intensity_prefix(carbon_intensity)
         carbon_cumsum = build_intensity_cumsum(carbon_prefix)
         window_start = datetime.fromisoformat(limitstart)
@@ -173,124 +153,12 @@ class CarbonIntensity:
                 results.append((value, window_start, window_start + timedelta(seconds=duration)))
         return results
 
-class CarbonIntensitySQL(CarbonIntensity):
-    def __init__(self, db):
-        self.db = db
-        self._yield_lowest_periods_cached = lru_cache(maxsize=YIELD_CACHE_SIZE)(self._yield_lowest_periods)
-        self.get_climate_data = lru_cache(maxsize=CLIMATE_CACHE_SIZE)(self._get_climate_data)
-
-    def fetch_climate_data_pure(self, start, end, postcode="OX11"):
-        logger.info(f"Downloading carbon intensity data between {start} and {end}...")
-        start, end = parse_time_inputs(start, end)
-
-        url = f"{BASE}/regional/intensity/{start}/{end}/postcode/{postcode}"
-        data = requests.get(url).json()
-        now_datetime = datetime.now(UTC)
-        data = data["data"]
-        regionid, shortname = data["regionid"], data["shortname"]
-        data = data["data"]
-
-        self.db["regions"].upsert({"regionid": regionid, "shortname": shortname}, ["regionid"])
-        self.db["postcodes"].upsert({"postcode": postcode, "regionid": regionid, "shortname": shortname}, ["postcode"])
-
-        for row in data:
-            timerange = f"{row['from']},{row['to']}"
-            typefield = datetime.fromisoformat(row["to"]) > now_datetime
-            typefield = "forecast" if typefield else "actual"
-            basedict = {"timerange": timerange, "type": typefield}
-            intensity = basedict.copy() | row["intensity"]
-            generationmix = basedict.copy() | {gendict["fuel"]: gendict["perc"] for gendict in row["generationmix"]}
-            self.db[f"region{regionid}_intensity"].upsert(intensity, ["timerange"])
-            self.db[f"region{regionid}_generationmix"].upsert(generationmix, ["timerange"])
-
-    def fetch_climate_data(self, start, end, postcode="OX11"):
-        start, end = parse_time_inputs(start, end)
-
-        region_row = self.db["postcodes"].find_one(postcode=postcode)
-        if region_row is None:
-            url = f"{BASE}/regional/postcode/{postcode}"
-            data = requests.get(url).json()["data"][0]
-            regionid, shortname = data["regionid"], data["shortname"]
-            self.db["regions"].upsert({"regionid": regionid, "shortname": shortname}, ["regionid"])
-            self.db["postcodes"].upsert({"postcode": postcode, "regionid": regionid, "shortname": shortname}, ["postcode"])
-        else:
-            regionid = region_row["regionid"]
-        tablebasename = f"region{regionid}"
-
-        limitstart, limitend = datetime.fromisoformat(start), datetime.fromisoformat(end)
-        start = limitstart
-        ranges = []
-        while True:
-            end = start + timedelta(minutes=30)
-            iso_start, iso_end = gen_iso_string(start.timestamp()), gen_iso_string(end.timestamp())
-            row = self.db[tablebasename+"_intensity"].find_one(timerange=f"{iso_start},{iso_end}")
-            if row is None or row["type"] in [None, "forecast"]:
-                if len(ranges) == 0:
-                    ranges.append([iso_start, iso_end])
-                else:
-                    if ranges[-1][1] == iso_start:
-                        ranges[-1][1] = iso_end
-                    else:
-                        ranges.append([iso_start, iso_end])
-            if end.timestamp() >= limitend.timestamp():
-                break
-            start += timedelta(minutes=30)
-
-        for arange in ranges:
-            self.fetch_climate_data_pure(*arange, postcode)
-    
-    def _get_climate_data(self, start, end, postcode="OX11", returnvalues="forecast"):
-        # returnvalues can be "forecast", "index" or "both"
-        # "forecast" is carbon intensity (in gco2/kwh) and index is "very low"/"low"/etc.
-        assert returnvalues in ["forecast", "index", "both"]
-        start, end = parse_time_inputs(start, end)
-
-        self.fetch_climate_data(start, end, postcode)
-        region_row = self.db["postcodes"].find_one(postcode=postcode)
-        assert region_row is not None
-        tablebasename = f"region{region_row['regionid']}"
-
-        limitstart, limitend = datetime.fromisoformat(start), datetime.fromisoformat(end)
-        start = limitstart
-        results = {}
-        while True:
-            end = start + timedelta(minutes=30)
-            iso_start, iso_end = gen_iso_string(start.timestamp()), gen_iso_string(end.timestamp())
-            intensity_row = self.db[tablebasename+"_intensity"].find_one(timerange=f"{iso_start},{iso_end}")
-            if intensity_row is None:
-                raise MissingCarbonData(f"Missing data for {start} to {end}")
-            forecast, index = intensity_row["forecast"], intensity_row["index"]
-            key = (start, end)
-            if returnvalues == "forecast":
-                results[key] = forecast
-            elif returnvalues == "index":
-                results[key] = index
-            elif returnvalues == "both":
-                results[key] = [forecast, index]
-            else:
-                raise Exception(returnvalues)
-            if gen_iso_string(limitend.timestamp()) == iso_end:
-                break
-            start += timedelta(minutes=30)
-        return results
-
-class CarbonIntensitySQLite(CarbonIntensitySQL):
-    def __init__(self):
-        super().__init__(
-            dataset.connect((project_root / "carbondata.db").as_uri().replace("file:", "sqlite:"))
-        )
-
-
-class CarbonIntensityMariaDB(CarbonIntensitySQL):
-    def __init__(self):
-        creds = dotenv_values(project_root / ".env")
-        db_url = f"mariadb+mariadbconnector://{creds['DB_USERNAME']}:{creds['DB_PASSWORD']}@/{creds['PROCESSED_DATABASE']}?unix_socket=/var/lib/mysql/mysql.sock"
-        db = dataset.connect(db_url)
-        super().__init__(db)
-
 class CarbonIntensityCSV(CarbonIntensity):
-    def __init__(self, head_fraction=DEFAULT_HEAD_FRACTION, head_weight=DEFAULT_HEAD_WEIGHT, max_wait_hours=None):
+    def __init__(self, csv_path, column, forecast_horizon_hours, head_fraction=DEFAULT_HEAD_FRACTION, head_weight=DEFAULT_HEAD_WEIGHT, max_wait_hours=None):
         # fixed at construction: the lru_cache below would otherwise serve stale windows
+        self.csv_path = csv_path
+        self.column = column
+        self.forecast_horizon_hours = forecast_horizon_hours
         self.head_fraction = head_fraction
         self.head_weight = head_weight
         self.max_wait = None if max_wait_hours is None else timedelta(hours=max_wait_hours)
@@ -302,19 +170,22 @@ class CarbonIntensityCSV(CarbonIntensity):
 
     def cache_csv_data(self):
         self.csv_data = {}
-        with open(project_root / "main/regional_carbon_intensity.csv", mode="r", encoding="utf-8") as file:
+        with open(self.csv_path, mode="r", encoding="utf-8") as file:
             reader = csv.DictReader(file)
+            if self.column not in (reader.fieldnames or []):
+                raise ValueError(f"{self.csv_path} has no column {self.column!r}; columns: {', '.join(reader.fieldnames or [])}")
             for row in reader:
                 start = datetime.fromisoformat(row["datetime"]).replace(tzinfo=UTC)
+                if start.minute % 30 or start.second or start.microsecond:
+                    raise ValueError(f"{self.csv_path}: slot {row['datetime']} is not on a 30-minute boundary; the scheduler needs 30-minute slots")
                 end = start + timedelta(minutes=30)
-                value = row["South England"]
+                value = row[self.column]
                 if not value:
                     continue
                 self.csv_data[(start, end)] = float(value)
 
-    def _get_climate_data(self, start, end, postcode="OX11", returnvalues="forecast"):
+    def _get_climate_data(self, start, end, returnvalues="forecast"):
         # returns {(start_datetime, end_datetime): intensityint, ...}
-        assert postcode.startswith("OX"), "Region lookup is currently not supported"
         assert returnvalues == "forecast", "Index is currently not supported"
         limitstart, limitend = datetime.fromisoformat(start), datetime.fromisoformat(end)
         start = limitstart
@@ -335,13 +206,15 @@ if __name__ == "__main__":
     import random
     random.seed(42)
     logging.basicConfig(level=logging.INFO)
-    cidservice = CarbonIntensityCSV()
-    start_range, end_range = 1725608400, 1780351201
+    from datasetconfig import load_dataset_config
+    config = load_dataset_config(check_carbon=True)
+    cidservice = CarbonIntensityCSV(config.carbon_csv, config.carbon_column, config.forecast_horizon_hours)
+    start_range, end_range = config.start_epoch, config.end_epoch
     randranges = []
     while len(randranges) < 10:
         randrange = random.randint(start_range, end_range)
 
-        for period in cidservice.yield_lowest_periods(datetime.fromtimestamp(randrange, tz=UTC), 30*60, "OX11"):
+        for period in cidservice.yield_lowest_periods(datetime.fromtimestamp(randrange, tz=UTC), 30*60):
             print(period)
             break
 
@@ -349,4 +222,4 @@ if __name__ == "__main__":
         
         if randrange not in randranges:
             randranges.append(randrange)
-    print(cidservice.get_climate_data(*randrange, "OX11"))
+    print(cidservice.get_climate_data(*randrange))
