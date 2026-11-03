@@ -12,6 +12,7 @@
 
 !example_graph.png
 !main/regional_carbon_intensity.csv
+!LICENSE.txt
 
 *.db
 *.db-shm
