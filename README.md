@@ -75,7 +75,7 @@ for p in 10 25 50 75; do
 done
 ```
 
-That is 11 invocations. Each writes its own log in `benchmark/temp/`, and the name carries the suffix that tells the arms apart (`-mw24`, `-rp50` and so on; the baseline has neither). Keep `--commit` the same so every arm runs the same code. Then:
+That is 9 invocations. Each writes its own log in `benchmark/temp/`, and the name carries the suffix that tells the arms apart (`-mw24`, `-rp50` and so on; the baseline has neither). Keep `--commit` the same so every arm runs the same code. Then:
 
 ```bash
 uv run process.py          # one CSV per log in benchmark/processed/
@@ -88,4 +88,4 @@ Practical points when you launch this many sweeps at once:
 
 - Each invocation resolves dependencies in its own snapshot. `uv.lock` is git-ignored, so many at once can hit uv's cache lock timeout; stagger the launches and consider `export UV_LOCK_TIMEOUT=1800`.
 - `--days-to-fetch 30` streams 43 days per run (30 + 10 + 3), so the route needs a `resources` row that covers 43 days. The limits in the example file are placeholders.
-- Size the total before launching: on LOTUS the 12 arms were over 5,000 individually submitted jobs of 30 days each (453 dates per arm).
+- Size the total before launching: on LOTUS these 9 arms were about 4,000 individually submitted jobs of 30 days each (453 dates per arm).
