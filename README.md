@@ -47,7 +47,7 @@ For an overview of what the simulator and the benchmark harness do and how the f
 
 ## Worked example: the logs behind this graph
 
-![Example graph](example_graph.png)
+<img src="example_graph.png" width=50% height=50%>
 
 The graph above compares pooled carbon saving against 90th-percentile wait for LOTUS, one point per setting, for 30-day windows. The plotting code is not in this repository, so this section only covers how to produce the logs it reads. The recipe is one baseline plus 8 variants, each a separate `runmultiple.py` invocation over every 30-day window from `from_date`, all on the same commit and the same dates.
 
